@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
-import tomllib
 from pathlib import Path
 
 from executor import CommandResult
@@ -38,18 +37,13 @@ def test_sdk_can_normalize_and_inject_default_configuration() -> None:
     assert plugin.config.sandbox.enabled is True
 
 
-def test_packaged_configuration_is_sdk_valid() -> None:
+def test_runtime_configuration_is_generated_instead_of_committed() -> None:
     config_path = Path(__file__).resolve().parents[1] / "config.toml"
-    config = tomllib.loads(config_path.read_text(encoding="utf-8"))
-    plugin = create_plugin()
-    plugin.set_plugin_config(config)
-    assert plugin.config.plugin.config_version == "1.0.10"
-    assert plugin.config.sandbox.network_enabled is True
-    assert plugin.config.root_mode.enabled is False
-    config_text = config_path.read_text(encoding="utf-8")
-    assert "# 是否允许麦麦自主调用命令工具。" in config_text
-    assert "# 是否允许低权限沙箱命令访问公网、内网和本机网络服务。" in config_text
-    assert "# 最终确认：必须手动把 0 改成 1。" in config_text
+    assert not config_path.exists()
+
+    config = ServerCommandPlugin.build_default_config()
+    assert config["sandbox"]["network_enabled"] is False
+    assert config["root_mode"]["enabled"] is False
 
 
 def test_manifest_is_v2_and_matches_plugin_version() -> None:

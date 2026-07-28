@@ -79,13 +79,13 @@ Bubblewrap 的挂载和进程隔离；命令不依赖用户命名空间或 UID �
 ├── _manifest.json
 ├── assets/
 │   └── icon.png
-├── config.toml
 ├── executor.py
 ├── plugin.py
 └── README.md
 ```
 
-启动或重载 MaiBot。插件会自动创建
+启动或重载 MaiBot。Runner 会根据插件的 `config_model` 自动生成
+`config.toml`，插件还会自动创建
 `<MaiBot>/maibot-command-file/`。MaiBot 可以由 root 启动。插件让受信任的
 Bubblewrap 以 root 建立挂载、PID、IPC 和 UTS 隔离，然后在执行 Bash 前通过
 `/usr/bin/setpriv` 清空附加组，并不可逆地降权到 Ubuntu 自带的
@@ -159,7 +159,8 @@ MaiBot，但这只解决本插件命令的降权与隔离；其他插件仍会�
 - 最终数字确认输入框
 
 WebUI 中会显示“启用命令工具”“允许命令联网”“命令超时时间（秒）”等中文
-名称，并在每项下面显示中文说明；`config.toml` 中也有对应的逐项注释。
+名称，并在每项下面显示中文说明。运行时 `config.toml` 不随仓库分发，避免安装
+或升级时覆盖用户设置；它会在首次加载后由 Runner 根据中文配置模型生成。
 
 代码中另有不可由配置突破的硬上限。
 
