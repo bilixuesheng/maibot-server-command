@@ -7,6 +7,17 @@
 > **兼容性说明：本插件目前仅在 Ubuntu 上测试过，其他 Linux 发行版及操作系统
 > 未经测试，不保证能够正常运行。**
 
+## 使用前必须安装
+
+使用插件前，请先在 Ubuntu 服务器执行：
+
+```bash
+sudo apt update
+sudo apt install bubblewrap
+```
+
+> 如果未安装 Bubblewrap，低权限沙箱模式无法运行命令。
+
 版本 1.0.10 将插件展示名称改为“服务器命令执行”，更新项目简介与 GitHub
 仓库地址。权限、沙箱和 ROOT 模式逻辑均未改变。
 
@@ -54,13 +65,6 @@ Bubblewrap 的挂载和进程隔离；命令不依赖用户命名空间或 UID �
 - `maibot-plugin-sdk` 2.x
 - Bubblewrap
 - util-linux（Ubuntu 默认自带，用于 `/usr/bin/setpriv`）
-
-先安装系统依赖：
-
-```bash
-sudo apt update
-sudo apt install bubblewrap
-```
 
 将整个插件目录放入：
 
