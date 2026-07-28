@@ -1,0 +1,47 @@
+# 服务器命令执行插件配置
+# 修改后可在 MaiBot WebUI 中保存；部分版本需要重载插件或重启 MaiBot 才会生效。
+
+[plugin]
+# 配置结构版本，由插件维护，请勿手动修改。
+config_version = "1.0.10"
+
+[sandbox]
+# 是否允许麦麦自主调用命令工具。
+enabled = true
+
+# 是否允许低权限沙箱命令访问公网、内网和本机网络服务。
+# 开启后可使用 curl、wget；请勿在沙箱中存放密码、Token 等敏感文件。
+network_enabled = true
+
+# 单条命令最长运行时间，单位为秒；有效范围 1–300。
+timeout_seconds = 20
+
+# 标准输出 stdout 与错误输出 stderr 合计最多保留的字节数；有效范围 4096–1048576。
+max_output_bytes = 65536
+
+# 每个命令进程的最大虚拟内存，单位为 MB；有效范围 64–2048。
+memory_limit_mb = 256
+
+# 命令创建的单个文件最大大小，单位为 MB；有效范围 1–1024。
+file_size_limit_mb = 64
+
+# 命令及其子进程的数量上限；有效范围 8–128。
+max_processes = 32
+
+[root_mode]
+# 极高风险总开关。仅当 MaiBot 进程确实由 root 用户运行时才可能生效。
+# 单独开启此项不会关闭沙箱；下面三个确认开关和最终数字确认也必须全部完成。
+enabled = false
+
+# 第一次确认：我理解麦麦将获得整台服务器的最高权限。
+confirmation_1 = false
+
+# 第二次确认：我理解错误命令可能破坏系统、服务或重要数据。
+confirmation_2 = false
+
+# 第三次确认：我已做好备份，并自愿承担关闭沙箱的全部风险。
+confirmation_3 = false
+
+# 最终确认：必须手动把 0 改成 1。
+# 只有总开关、三次确认和此数值全部满足，ROOT 最高权限模式才会生效。
+final_confirmation = 0
