@@ -13,7 +13,7 @@ from maibot_sdk.types import ToolParameterInfo, ToolParamType
 def _load_sibling_executor() -> Any:
     """Load executor.py without relying on the Runner's sys.path."""
 
-    module_name = "_xuesheng_maibot_server_command_executor_v1_0_10"
+    module_name = "_xuesheng_maibot_server_command_executor_v1_0_11"
     loaded = sys.modules.get(module_name)
     if loaded is not None:
         return loaded
@@ -42,12 +42,22 @@ prepare_sandbox = _executor.prepare_sandbox
 resolve_execution_identity = _executor.resolve_execution_identity
 run_command = _executor.run_command
 run_root_command = _executor.run_root_command
+run_unrestricted_root_command = _executor.run_unrestricted_root_command
 
 
 ROOT_MODE_NOTICE = (
-    "⚠️ 当前权限模式：ROOT 最高权限（沙箱已关闭，工作目录为 /root）。\n"
+    "⚠️ 当前权限模式：受限 ROOT（沙箱已关闭，工作目录为 /root）。\n"
     "你现在拥有服务器最高权限。必须坚决拒绝高风险、破坏性、提权维持、"
-    "凭据读取或泄露数据的命令；不确定是否安全时不要执行。"
+    "凭据读取或泄露数据的命令；不确定是否安全时不要执行。\n"
+    "插件的正则防护无法保证识别 Base64、变量展开、eval 等混淆命令，"
+    "不能把“未被拦截”视为命令安全。"
+)
+
+UNRESTRICTED_ROOT_NOTICE = (
+    "☢️ 当前权限模式：完全 ROOT（沙箱已关闭，工作目录为 /root）。\n"
+    "管理员已完成十重认证，插件不会运行高风险命令正则拦截。"
+    "你拥有服务器最高权限，仍必须自行判断并坚决拒绝高风险、破坏性、"
+    "提权维持、凭据读取或泄露数据的命令；不确定是否安全时不要执行。"
 )
 
 
@@ -72,7 +82,10 @@ class CommandSandboxConfig(PluginConfigBase):
         description="是否允许沙箱命令访问网络（包括公网、内网和本机服务）",
         json_schema_extra={
             "label": "允许命令联网",
-            "hint": "开启后可使用 curl、wget 等访问公网、内网和本机网络服务。",
+            "hint": (
+                "开启后可使用 curl、wget 等访问公网；命令也可访问 localhost、"
+                "服务器内网和云元数据端点（如 169.254.169.254）。"
+            ),
             "x-widget": "switch",
         },
     )
@@ -129,9 +142,9 @@ class CommandSandboxConfig(PluginConfigBase):
 
 
 class RootPrivilegeConfig(PluginConfigBase):
-    """需要多重确认才能启用的 root 最高权限模式。"""
+    """需要多重确认才能启用的受限 root 模式。"""
 
-    __ui_label__ = "ROOT 最高权限（极高风险）"
+    __ui_label__ = "受限 ROOT（极高风险）"
     __ui_icon__ = "triangle-alert"
     __ui_order__ = 1
 
@@ -139,7 +152,7 @@ class RootPrivilegeConfig(PluginConfigBase):
         default=False,
         description="关闭命令沙箱并允许命令以 root 在 /root 中执行",
         json_schema_extra={
-            "label": "关闭沙箱并启用 ROOT 最高权限",
+            "label": "关闭沙箱并启用受限 ROOT",
             "hint": "极高风险：仅当 MaiBot 进程由 root 用户运行时才可能生效。单独打开此开关不会启用。",
             "x-widget": "switch",
         },
@@ -178,9 +191,123 @@ class RootPrivilegeConfig(PluginConfigBase):
         description="最终数字确认；必须手动从 0 改为 1",
         json_schema_extra={
             "label": "最终确认：把 0 改成 1",
-            "hint": "只有数值等于 1，且上面三个确认开关全部开启时，ROOT 模式才会生效。",
+            "hint": "只有数值等于 1，且上面三个确认开关全部开启时，受限 ROOT 才会生效。",
             "x-widget": "number",
             "step": 1,
+        },
+    )
+
+
+class UnrestrictedRootConfig(PluginConfigBase):
+    """只能从受限 ROOT 解锁的无命令正则拦截模式。"""
+
+    __ui_label__ = "完全 ROOT（无命令正则拦截）"
+    __ui_icon__ = "skull"
+    __ui_order__ = 2
+
+    enabled: bool = Field(
+        default=False,
+        description="在受限 ROOT 已生效后申请完全 ROOT",
+        json_schema_extra={
+            "label": "申请解锁完全 ROOT",
+            "hint": (
+                "必须先让上方受限 ROOT 真正生效，再完成下面十项认证；"
+                "单独打开不会生效。"
+            ),
+            "x-widget": "switch",
+        },
+    )
+    confirmation_1: bool = Field(
+        default=False,
+        description="第一项认证",
+        json_schema_extra={
+            "label": "认证 1：开启",
+            "hint": "完全 ROOT 的第一项认证必须开启。",
+            "x-widget": "switch",
+        },
+    )
+    confirmation_2: bool = Field(
+        default=False,
+        description="第二项认证",
+        json_schema_extra={
+            "label": "认证 2：开启",
+            "hint": "完全 ROOT 的第二项认证必须开启。",
+            "x-widget": "switch",
+        },
+    )
+    confirmation_3: bool = Field(
+        default=False,
+        description="第三项认证",
+        json_schema_extra={
+            "label": "认证 3：开启",
+            "hint": "完全 ROOT 的第三项认证必须开启。",
+            "x-widget": "switch",
+        },
+    )
+    confirmation_4: bool = Field(
+        default=False,
+        description="第四项认证",
+        json_schema_extra={
+            "label": "认证 4：开启",
+            "hint": "完全 ROOT 的第四项认证必须开启。",
+            "x-widget": "switch",
+        },
+    )
+    confirmation_5: bool = Field(
+        default=False,
+        description="第五项认证",
+        json_schema_extra={
+            "label": "认证 5：开启",
+            "hint": "完全 ROOT 的第五项认证必须开启。",
+            "x-widget": "switch",
+        },
+    )
+    confirmation_6: bool = Field(
+        default=True,
+        description="第六项认证；必须关闭",
+        json_schema_extra={
+            "label": "认证 6：关闭",
+            "hint": "此项默认开启，必须手动关闭。",
+            "x-widget": "switch",
+        },
+    )
+    confirmation_7: bool = Field(
+        default=False,
+        description="第七项认证；必须开启",
+        json_schema_extra={
+            "label": "认证 7：开启",
+            "hint": "此项必须开启。",
+            "x-widget": "switch",
+        },
+    )
+    confirmation_8: bool = Field(
+        default=True,
+        description="第八项认证；必须关闭",
+        json_schema_extra={
+            "label": "认证 8：关闭",
+            "hint": "此项默认开启，必须手动关闭。",
+            "x-widget": "switch",
+        },
+    )
+    confirmation_9: int = Field(
+        default=1,
+        ge=0,
+        le=1,
+        description="第九项认证；必须从 1 改为 0",
+        json_schema_extra={
+            "label": "认证 9：把 1 改成 0",
+            "hint": "此项默认是 1，必须手动改为 0。",
+            "x-widget": "number",
+            "step": 1,
+        },
+    )
+    confirmation_10: bool = Field(
+        default=True,
+        description="第十项认证；必须从 true 改为 false",
+        json_schema_extra={
+            "label": "认证 10：把 true 改成 false",
+            "hint": "此项默认开启（true），必须手动关闭为 false。",
+            "x-widget": "switch",
         },
     )
 
@@ -193,7 +320,7 @@ class PluginMetadataConfig(PluginConfigBase):
     __ui_order__ = -1
 
     config_version: str = Field(
-        default="1.0.10",
+        default="1.0.11",
         description="配置结构版本",
         json_schema_extra={
             "label": "配置版本",
@@ -209,6 +336,7 @@ class ServerCommandPluginConfig(PluginConfigBase):
     plugin: PluginMetadataConfig = Field(default_factory=PluginMetadataConfig)
     sandbox: CommandSandboxConfig = Field(default_factory=CommandSandboxConfig)
     root_mode: RootPrivilegeConfig = Field(default_factory=RootPrivilegeConfig)
+    unrestricted_root: UnrestrictedRootConfig = Field(default_factory=UnrestrictedRootConfig)
 
 
 class ServerCommandPlugin(MaiBotPlugin):
@@ -241,11 +369,52 @@ class ServerCommandPlugin(MaiBotPlugin):
             return False, "；".join(missing)
         return True, "已满足 root 用户、总开关、三次开关和数值 1 的全部条件"
 
+    def _unrestricted_root_state(
+        self,
+        restricted_root_active: bool | None = None,
+    ) -> tuple[bool, str]:
+        settings = self.config.unrestricted_root
+        if not settings.enabled:
+            return False, "完全 ROOT 总开关未开启"
+
+        if restricted_root_active is None:
+            restricted_root_active, _ = self._root_mode_state()
+
+        missing = []
+        if not restricted_root_active:
+            missing.append("受限 ROOT 尚未生效")
+        for index in range(1, 6):
+            if not bool(getattr(settings, f"confirmation_{index}")):
+                missing.append(f"认证 {index} 未开启")
+        if settings.confirmation_6:
+            missing.append("认证 6 未关闭")
+        if not settings.confirmation_7:
+            missing.append("认证 7 未开启")
+        if settings.confirmation_8:
+            missing.append("认证 8 未关闭")
+        if int(settings.confirmation_9) != 0:
+            missing.append("认证 9 未从 1 改为 0")
+        if settings.confirmation_10:
+            missing.append("认证 10 未从 true 改为 false")
+        if missing:
+            return False, "；".join(missing)
+        return True, "受限 ROOT 已生效且十项认证全部匹配"
+
     @staticmethod
     def _root_result(result: Any) -> dict[str, object]:
         payload = result.as_dict()
         payload["content"] = f"{ROOT_MODE_NOTICE}\n\n{payload['content']}"
-        payload["execution_mode"] = "root"
+        payload["execution_mode"] = "root_restricted"
+        payload["command_regex_guard"] = "enabled"
+        payload["working_directory"] = "/root"
+        return payload
+
+    @staticmethod
+    def _unrestricted_root_result(result: Any) -> dict[str, object]:
+        payload = result.as_dict()
+        payload["content"] = f"{UNRESTRICTED_ROOT_NOTICE}\n\n{payload['content']}"
+        payload["execution_mode"] = "root_unrestricted"
+        payload["command_regex_guard"] = "disabled"
         payload["working_directory"] = "/root"
         return payload
 
@@ -257,17 +426,31 @@ class ServerCommandPlugin(MaiBotPlugin):
 
     async def on_load(self) -> None:
         root_active, root_reason = self._root_mode_state()
+        unrestricted_active, unrestricted_reason = self._unrestricted_root_state(root_active)
+        if unrestricted_active:
+            self._sandbox_path = None
+            self._sandbox_error = ""
+            self.ctx.logger.critical(
+                "完全 ROOT 模式已启用：sandbox=disabled cwd=/root regex_guard=disabled；"
+                "命令不会经过高风险正则拦截"
+            )
+            return
+        if self.config.unrestricted_root.enabled:
+            self.ctx.logger.warning(
+                "完全 ROOT 模式未生效：reason=%s",
+                unrestricted_reason,
+            )
         if root_active:
             self._sandbox_path = None
             self._sandbox_error = ""
             self.ctx.logger.critical(
-                "ROOT 最高权限模式已启用：沙箱已关闭，命令将以 root 在 /root 执行；"
+                "受限 ROOT 模式已启用：沙箱已关闭，命令将以 root 在 /root 执行；"
                 "插件会拒绝识别到的高风险命令"
             )
             return
         if self.config.root_mode.enabled:
             self.ctx.logger.warning(
-                "ROOT 最高权限模式未生效，将继续使用低权限沙箱：reason=%s",
+                "受限 ROOT 模式未生效，将继续使用低权限沙箱：reason=%s",
                 root_reason,
             )
         try:
@@ -297,17 +480,32 @@ class ServerCommandPlugin(MaiBotPlugin):
         del config_data
         if scope == CONFIG_RELOAD_SCOPE_SELF:
             root_active, root_reason = self._root_mode_state()
-            if root_active:
+            unrestricted_active, unrestricted_reason = self._unrestricted_root_state(root_active)
+            if unrestricted_active:
                 self.ctx.logger.critical(
-                    "配置更新后 ROOT 最高权限模式已启用：version=%s cwd=/root sandbox=disabled",
+                    "配置更新后完全 ROOT 已启用：version=%s cwd=/root "
+                    "sandbox=disabled regex_guard=disabled",
+                    version,
+                )
+            elif root_active:
+                if self.config.unrestricted_root.enabled:
+                    self.ctx.logger.warning(
+                        "配置更新后完全 ROOT 未生效：reason=%s",
+                        unrestricted_reason,
+                    )
+                self.ctx.logger.critical(
+                    "配置更新后受限 ROOT 已启用：version=%s cwd=/root "
+                    "sandbox=disabled regex_guard=enabled",
                     version,
                 )
             else:
                 self.ctx.logger.info(
-                    "命令插件配置已更新：version=%s network_enabled=%s root_mode=false reason=%s",
+                    "命令插件配置已更新：version=%s network_enabled=%s "
+                    "root_mode=false root_reason=%s unrestricted_reason=%s",
                     version,
                     self.config.sandbox.network_enabled,
                     root_reason,
+                    unrestricted_reason,
                 )
 
     @Tool(
@@ -315,11 +513,12 @@ class ServerCommandPlugin(MaiBotPlugin):
         brief_description="在服务器的专用 Ubuntu 沙箱目录中运行命令",
         detailed_description=(
             "默认仅在 MaiBot 主程序目录下的 maibot-command-file 沙箱中执行 Bash 命令。"
-            "管理员完成 ROOT 最高权限模式的全部多重确认后，沙箱会关闭，命令将以 root "
-            "在 /root 中执行；每次结果都会明确提示当前拥有服务器最高权限。"
-            "ROOT 模式下必须坚决拒绝高风险、破坏性、凭据读取、维持提权或数据外传命令；"
-            "不确定是否安全时不要调用，插件也会拦截能够识别的明显高风险命令。"
-            "低权限沙箱由管理员的联网开关控制；ROOT 模式直接使用宿主机网络，"
+            "管理员完成受限 ROOT 的全部确认后，沙箱会关闭，命令将以 root 在 /root "
+            "中执行，并拦截正则能够识别的明显高风险命令；正则无法保证识别混淆命令。"
+            "只有受限 ROOT 已生效且十项认证全部匹配，才会进入不做命令正则拦截的完全 ROOT。"
+            "两种 ROOT 模式下都必须坚决拒绝高风险、破坏性、凭据读取、维持提权或"
+            "数据外传命令；不确定是否安全时不要调用。"
+            "低权限沙箱由管理员的联网开关控制；两种 ROOT 模式直接使用宿主机网络，"
             "不受该联网开关限制。"
             "调用前先根据返回的权限模式判断实际边界。"
         ),
@@ -355,6 +554,7 @@ class ServerCommandPlugin(MaiBotPlugin):
             }
 
         root_active, root_reason = self._root_mode_state()
+        unrestricted_active, unrestricted_reason = self._unrestricted_root_state(root_active)
         settings = self.config.sandbox
         audit_id = command_audit_id(str(command))
         limits = SandboxLimits(
@@ -364,11 +564,63 @@ class ServerCommandPlugin(MaiBotPlugin):
             file_size_limit_mb=settings.file_size_limit_mb,
             max_processes=settings.max_processes,
         )
+        if unrestricted_active:
+            try:
+                self.ctx.logger.critical(
+                    "麦麦准备执行完全 ROOT 命令：command_id=%s cwd=/root "
+                    "regex_guard=disabled timeout=%ss",
+                    audit_id,
+                    min(max(1, int(timeout_seconds)), limits.normalized().timeout_seconds),
+                )
+                result = await run_unrestricted_root_command(
+                    str(command),
+                    limits,
+                    requested_timeout=timeout_seconds,
+                )
+                if result.timed_out:
+                    self.ctx.logger.warning(
+                        "完全 ROOT 命令执行超时：command_id=%s exit_code=%s",
+                        audit_id,
+                        result.exit_code,
+                    )
+                elif result.exit_code != 0:
+                    self.ctx.logger.warning(
+                        "完全 ROOT 命令执行失败：command_id=%s exit_code=%s",
+                        audit_id,
+                        result.exit_code,
+                    )
+                else:
+                    self.ctx.logger.warning(
+                        "完全 ROOT 命令执行成功：command_id=%s exit_code=0",
+                        audit_id,
+                    )
+                return self._unrestricted_root_result(result)
+            except Exception as exc:
+                self.ctx.logger.exception(
+                    "完全 ROOT 命令未执行或插件异常：command_id=%s error=%s",
+                    audit_id,
+                    exc,
+                )
+                return {
+                    "success": False,
+                    "name": "run_server_command",
+                    "content": f"{UNRESTRICTED_ROOT_NOTICE}\n\n命令未执行：{exc}",
+                    "execution_mode": "root_unrestricted",
+                    "command_regex_guard": "disabled",
+                    "working_directory": "/root",
+                }
+
+        if self.config.unrestricted_root.enabled:
+            self.ctx.logger.warning(
+                "完全 ROOT 配置不完整，本次使用受限 ROOT 或低权限沙箱：reason=%s",
+                unrestricted_reason,
+            )
+
         if root_active:
             risk_reason = high_risk_command_reason(str(command))
             if risk_reason is not None:
                 self.ctx.logger.critical(
-                    "ROOT 最高权限命令被安全策略拒绝：command_id=%s risk=%s",
+                    "受限 ROOT 命令被安全策略拒绝：command_id=%s risk=%s",
                     audit_id,
                     risk_reason,
                 )
@@ -379,12 +631,13 @@ class ServerCommandPlugin(MaiBotPlugin):
                         f"{ROOT_MODE_NOTICE}\n\n"
                         f"状态：已拒绝\n原因：检测到高风险操作（{risk_reason}）。"
                     ),
-                    "execution_mode": "root",
+                    "execution_mode": "root_restricted",
+                    "command_regex_guard": "enabled",
                     "working_directory": "/root",
                 }
             try:
                 self.ctx.logger.critical(
-                    "麦麦准备执行 ROOT 最高权限命令：command_id=%s cwd=/root timeout=%ss",
+                    "麦麦准备执行受限 ROOT 命令：command_id=%s cwd=/root timeout=%ss",
                     audit_id,
                     min(max(1, int(timeout_seconds)), limits.normalized().timeout_seconds),
                 )
@@ -395,25 +648,25 @@ class ServerCommandPlugin(MaiBotPlugin):
                 )
                 if result.timed_out:
                     self.ctx.logger.warning(
-                        "ROOT 最高权限命令执行超时：command_id=%s exit_code=%s",
+                        "受限 ROOT 命令执行超时：command_id=%s exit_code=%s",
                         audit_id,
                         result.exit_code,
                     )
                 elif result.exit_code != 0:
                     self.ctx.logger.warning(
-                        "ROOT 最高权限命令执行失败：command_id=%s exit_code=%s",
+                        "受限 ROOT 命令执行失败：command_id=%s exit_code=%s",
                         audit_id,
                         result.exit_code,
                     )
                 else:
                     self.ctx.logger.warning(
-                        "ROOT 最高权限命令执行成功：command_id=%s exit_code=0",
+                        "受限 ROOT 命令执行成功：command_id=%s exit_code=0",
                         audit_id,
                     )
                 return self._root_result(result)
             except Exception as exc:
                 self.ctx.logger.exception(
-                    "ROOT 最高权限命令被拒绝或插件异常：command_id=%s error=%s",
+                    "受限 ROOT 命令被拒绝或插件异常：command_id=%s error=%s",
                     audit_id,
                     exc,
                 )
@@ -421,13 +674,14 @@ class ServerCommandPlugin(MaiBotPlugin):
                     "success": False,
                     "name": "run_server_command",
                     "content": f"{ROOT_MODE_NOTICE}\n\n命令未执行：{exc}",
-                    "execution_mode": "root",
+                    "execution_mode": "root_restricted",
+                    "command_regex_guard": "enabled",
                     "working_directory": "/root",
                 }
 
         if self.config.root_mode.enabled:
             self.ctx.logger.warning(
-                "ROOT 最高权限配置不完整，本次继续使用低权限沙箱：reason=%s",
+                "受限 ROOT 配置不完整，本次继续使用低权限沙箱：reason=%s",
                 root_reason,
             )
         if self._sandbox_path is None:

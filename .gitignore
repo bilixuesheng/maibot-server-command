@@ -1,5 +1,6 @@
 /__pycache__/
 /.pytest_cache/
 /upload/
+/config.toml
 *.zip
 *.py[cod]

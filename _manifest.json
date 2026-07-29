@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "xuesheng.maibot-server-command",
-  "version": "1.0.10",
+  "version": "1.0.11",
   "name": "服务器命令执行",
   "description": "让 MaiBot 在低权限沙箱中运行 Ubuntu 命令，并提供可选 ROOT 最高权限模式",
   "author": {

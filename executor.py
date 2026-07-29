@@ -593,10 +593,12 @@ async def run_command(
     )
 
 
-async def run_root_command(
+async def _run_root_command(
     command: str,
     limits: SandboxLimits,
     requested_timeout: int | None = None,
+    *,
+    enforce_high_risk_guard: bool,
 ) -> CommandResult:
     """Run an explicitly confirmed command as root in /root without Bubblewrap."""
 
@@ -605,9 +607,10 @@ async def run_root_command(
     if os.geteuid() != 0:
         raise SandboxError("root 最高权限模式只能在 MaiBot 由 root 用户运行时使用。")
     _validate_command_text(command)
-    risk_reason = high_risk_command_reason(command)
-    if risk_reason is not None:
-        raise HighRiskCommandError(f"高风险命令已被插件拒绝：{risk_reason}。")
+    if enforce_high_risk_guard:
+        risk_reason = high_risk_command_reason(command)
+        if risk_reason is not None:
+            raise HighRiskCommandError(f"高风险命令已被插件拒绝：{risk_reason}。")
     if not ROOT_WORKING_DIRECTORY.is_dir():
         raise SandboxError("root 工作目录 /root 不存在，拒绝执行命令。")
 
@@ -670,4 +673,39 @@ async def run_root_command(
         stderr=stderr_buffer.decode("utf-8", errors="replace"),
         timed_out=timed_out,
         output_truncated=truncated[0],
+    )
+
+
+async def run_root_command(
+    command: str,
+    limits: SandboxLimits,
+    requested_timeout: int | None = None,
+) -> CommandResult:
+    """Run a restricted-root command after applying the high-risk regex guard."""
+
+    return await _run_root_command(
+        command,
+        limits,
+        requested_timeout=requested_timeout,
+        enforce_high_risk_guard=True,
+    )
+
+
+async def run_unrestricted_root_command(
+    command: str,
+    limits: SandboxLimits,
+    requested_timeout: int | None = None,
+) -> CommandResult:
+    """Run a fully confirmed root command without the high-risk regex guard.
+
+    Operational timeout, output capture and Unix resource ceilings remain in
+    place so a tool call can terminate and return a bounded result. They do not
+    restrict which root operations Bash is allowed to attempt.
+    """
+
+    return await _run_root_command(
+        command,
+        limits,
+        requested_timeout=requested_timeout,
+        enforce_high_risk_guard=False,
     )

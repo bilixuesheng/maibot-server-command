@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import errno
 import os
 import pwd
@@ -10,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+import executor
 from executor import (
     ABSOLUTE_MAX_TIMEOUT_SECONDS,
     MAX_COMMAND_BYTES,
@@ -23,6 +25,8 @@ from executor import (
     high_risk_command_reason,
     prepare_sandbox,
     resolve_execution_identity,
+    run_root_command,
+    run_unrestricted_root_command,
     validate_sandbox_contents,
 )
 
@@ -163,6 +167,29 @@ def test_root_high_risk_guard_refuses_dangerous_categories(
 )
 def test_root_high_risk_guard_allows_non_destructive_commands(command: str) -> None:
     assert high_risk_command_reason(command) is None
+
+
+def test_root_entrypoints_enable_guard_only_for_restricted_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    guard_values = []
+
+    async def fake_run(
+        command: str,
+        limits: SandboxLimits,
+        requested_timeout: int | None = None,
+        *,
+        enforce_high_risk_guard: bool,
+    ):
+        del command, limits, requested_timeout
+        guard_values.append(enforce_high_risk_guard)
+        return object()
+
+    monkeypatch.setattr(executor, "_run_root_command", fake_run)
+    limits = SandboxLimits()
+    asyncio.run(run_root_command("rm -rf /root/old-data", limits))
+    asyncio.run(run_unrestricted_root_command("rm -rf /root/old-data", limits))
+    assert guard_values == [True, False]
 
 
 def test_bwrap_can_receive_sandbox_by_fd(tmp_path: Path) -> None:
