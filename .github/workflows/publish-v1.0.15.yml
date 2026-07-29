@@ -1,0 +1,154 @@
+name: Publish and verify v1.0.15
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/publish-v1.0.15.yml
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Refuse an existing tag or release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view v1.0.15 --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Release v1.0.15 already exists; refusing to overwrite it." >&2
+            exit 1
+          fi
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/v1.0.15" >/dev/null 2>&1; then
+            echo "Tag v1.0.15 already exists; refusing to overwrite it." >&2
+            exit 1
+          fi
+
+      - name: Check out the verified product commit
+        uses: actions/checkout@v4
+        with:
+          ref: 94c6eb8d4f95726cb63c0514eb0ab89bb3c50fbc
+          fetch-depth: 0
+
+      - name: Build and verify the exact release archive
+        run: |
+          mkdir -p release/maibot-server-command/assets
+          cp .gitignore LICENSE README.md _manifest.json executor.py file_upload.py plugin.py requirements.txt temp_cleanup.py release/maibot-server-command/
+          cp assets/icon.png release/maibot-server-command/assets/icon.png
+          find release/maibot-server-command -exec touch -t 202607291600.00 {} +
+          (
+            cd release
+            zip -X -q maibot-server-command-1.0.15.zip \
+              maibot-server-command/ \
+              maibot-server-command/temp_cleanup.py \
+              maibot-server-command/requirements.txt \
+              maibot-server-command/_manifest.json \
+              maibot-server-command/LICENSE \
+              maibot-server-command/file_upload.py \
+              maibot-server-command/.gitignore \
+              maibot-server-command/plugin.py \
+              maibot-server-command/assets/ \
+              maibot-server-command/assets/icon.png \
+              maibot-server-command/README.md \
+              maibot-server-command/executor.py
+          )
+          echo "b798deafb9e091356fee72aa8f7bce55d0778ce753e1e9b49f2c9e961b5c4831  release/maibot-server-command-1.0.15.zip" | sha256sum --check --strict
+          test "$(unzip -Z1 release/maibot-server-command-1.0.15.zip | grep -v '/$' | wc -l)" -eq 10
+          ! unzip -Z1 release/maibot-server-command-1.0.15.zip | grep -Eq '(^|/)(config\.toml|ci_|__pycache__|.*\.pyc$|\.github/)'
+
+      - name: Write release notes
+        run: |
+          cat > release-notes.md <<'RELEASE_NOTES'
+          ## 版本范围
+
+          - MaiBot：1.1.0 ～ 1.99.99
+          - maibot-plugin-sdk：2.3.0 ～ 2.99.99
+
+          ## 更新日志
+
+          ### 可信 QQ 私聊白名单
+
+          - 新增默认关闭的可信 QQ 私聊完全绕过功能。
+          - 只有 Host 强制绑定的真实 QQ 私聊 Action 才能进入特权入口；模型参数、群聊、多账号歧义和无法核实的会话不能冒充。
+          - 命中白名单后可绕过 Bubblewrap、命令正则与敏感内容扫描，但仍受“启用命令工具”和“启用 QQ 文件上传”两个总开关控制。
+          - 无扫描文件只能发回发起操作的同一个白名单私聊，不能转发群聊、其他 QQ 或其他账号。
+
+          ### NapCat 本地路径大文件传输
+
+          - 新增默认关闭的共享暂存目录传输，NapCat 直接读取只读随机副本，不再把整个文件 Base64 塞入一次 IPC。
+          - 开启后普通 Shell 与白名单 Shell 均可使用；文件上限最高可配置到 1024 MiB。
+          - 发送前再次核验文件身份，成功后删除暂存副本；回执不明确、取消、重载或异常时保留并交给到期清理。
+          - 仍拒绝符号链接、硬链接、设备文件、竞态替换和越界路径。
+
+          ### 安全与配置修复
+
+          - 私钥检测改为完整首尾标记和有效主体匹配，修复扫描器把自己的规则源码误报为私钥，同时保留 RSA、EC、PKCS#8、OpenSSH、PGP、编码内容和 ZIP 内私钥拦截。
+          - 大文件敏感扫描改为固定窗口流式处理，避免按文件大小线性占用内存。
+          - 完全 ROOT 的认证 1～8 全部默认关闭，正确状态混合开启与关闭；认证 9、10 保持手动输入，防止无脑连续点击通过。
+          - 旧版第 10 项布尔配置会安全迁移为文字值，避免升级后配置加载失败。
+          - 文件入口 Host 超时提高到 30 分钟，命令入口 Host 超时覆盖插件自身 300 秒上限。
+
+          ## 验证记录
+
+          - Ubuntu 24.04 下分别使用最低 SDK 2.3.0 与当前 SDK 通过完整门禁。
+          - 真实 Bubblewrap、UID 0 降权到 nobody、ROOT 监督器、OpenSSL 与 ssh-keygen 私钥、11 MiB 本地路径发送、身份伪造、群聊隔离、发送前篡改、取消和重载场景均通过。
+          - “8 个认证开关全部开启”和“8 个全部保持关闭”都不能解锁。
+          - 正式 ZIP 仅含 10 个运行文件，并与发布源码逐字节一致。
+
+          尚未冒充验证的边界：本次自动门禁没有连接你的真实 NapCat 与 QQ 账号。启用共享路径前，请确认 MaiBot 与 NapCat 对配置目录具有相同路径视图，并先用非敏感测试文件实发一次。
+
+          ## 文件校验
+
+          `maibot-server-command-1.0.15.zip`
+
+          SHA-256：`b798deafb9e091356fee72aa8f7bce55d0778ce753e1e9b49f2c9e961b5c4831`
+          RELEASE_NOTES
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create v1.0.15 \
+            release/maibot-server-command-1.0.15.zip \
+            --repo "${GITHUB_REPOSITORY}" \
+            --target 94c6eb8d4f95726cb63c0514eb0ab89bb3c50fbc \
+            --title "服务器命令执行 v1.0.15" \
+            --notes-file release-notes.md \
+            --latest
+
+      - name: Verify the public tag, notes, and asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/v1.0.15")"
+          jq -e '
+            .tag_name == "v1.0.15" and
+            .name == "服务器命令执行 v1.0.15" and
+            .draft == false and
+            .prerelease == false and
+            ([.assets[] | select(.name == "maibot-server-command-1.0.15.zip")] | length == 1) and
+            (.assets | length == 1)
+          ' <<<"${release_json}" >/dev/null
+          body="$(jq -r '.body' <<<"${release_json}")"
+          grep -Fq "b798deafb9e091356fee72aa8f7bce55d0778ce753e1e9b49f2c9e961b5c4831" <<<"${body}"
+          test "$(gh api "repos/${GITHUB_REPOSITORY}/commits/v1.0.15" --jq '.sha')" = "94c6eb8d4f95726cb63c0514eb0ab89bb3c50fbc"
+          mkdir -p release-verification
+          gh release download v1.0.15 \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern "maibot-server-command-1.0.15.zip" \
+            --dir release-verification
+          echo "b798deafb9e091356fee72aa8f7bce55d0778ce753e1e9b49f2c9e961b5c4831  release-verification/maibot-server-command-1.0.15.zip" | sha256sum --check --strict
+
+      - name: Remove this temporary workflow
+        run: |
+          git fetch origin main
+          git checkout -B main origin/main
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/publish-v1.0.15.yml
+          git commit -m "chore: remove temporary v1.0.15 release workflow (release and SHA-256 verified)"
+          git push origin HEAD:main
