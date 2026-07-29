@@ -1,9 +1,9 @@
 {
   "manifest_version": 2,
   "id": "xuesheng.maibot-server-command",
-  "version": "1.0.14",
+  "version": "1.0.15",
   "name": "服务器命令执行",
-  "description": "让 MaiBot 安全运行服务器命令、发送非敏感文件并自动清理受管临时文件",
+  "description": "让 MaiBot 运行受控服务器命令、发送服务器文件并安全清理临时副本",
   "author": {
     "name": "XUESHENG",
     "url": "https://github.com/bilixuesheng"
@@ -13,11 +13,11 @@
     "repository": "https://github.com/bilixuesheng/maibot-server-command"
   },
   "host_application": {
-    "min_version": "1.0.8",
+    "min_version": "1.1.0",
     "max_version": "1.99.99"
   },
   "sdk": {
-    "min_version": "2.0.0",
+    "min_version": "2.3.0",
     "max_version": "2.99.99"
   },
   "dependencies": [],
