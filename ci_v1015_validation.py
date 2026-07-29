@@ -605,3 +605,5 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+# Updating this temporary gate file intentionally triggers the isolated branch workflow.
