@@ -258,17 +258,9 @@ confirmation_10 = false
 原因。要彻底关闭 ROOT 权限，把 `[root_mode].enabled` 和
 `[unrestricted_root].enabled` 都改回 `false`。
 
-## 测试
+## 部署后检查
 
-在插件目录运行：
-
-```bash
-python -m pytest -q
-```
-
-由于 CI 或容器环境可能禁止创建所有命名空间，单元测试检查路径解析、Manifest
-组件、root/普通用户两种参数构造、降权参数及逃逸防护；部署后的实际隔离是否
-可用，应再让 MaiBot 执行：
+安装插件后，可让 MaiBot 执行：
 
 ```bash
 pwd
@@ -289,7 +281,3 @@ curl -I --max-time 10 https://example.com
 麦麦会收到退出码、标准输出、标准错误、是否超时和输出是否被截断。服务器日志会
 记录命令开始、成功、非零退出、超时或沙箱异常；日志只记录命令摘要 ID，不记录
 完整命令，避免将命令中的密码或 Token 写入日志。
-
-仓库的 GitHub Actions 还会在 Ubuntu 上安装 Bubblewrap，以 root 启动真实低权限
-集成测试，验证最终 Bash 的 UID 已降为 `nobody`、工作目录是 `/work`，且宿主机
-`/root` 没有挂载进沙箱。
