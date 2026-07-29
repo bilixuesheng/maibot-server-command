@@ -4,9 +4,12 @@ import asyncio
 import errno
 import os
 import pwd
+import resource
+import shlex
 import shutil
 import stat
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -382,6 +385,155 @@ def test_limits_are_clamped() -> None:
     assert limits.file_size_limit_mb == 1_024
     assert limits.max_processes == 128
     assert MAX_COMMAND_BYTES == 16_384
+
+
+def test_root_resource_limits_do_not_claim_rlimit_nproc_for_uid_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[int, tuple[int, int]]] = []
+
+    class FakeLibC:
+        @staticmethod
+        def prctl(*args: int) -> int:
+            del args
+            return 0
+
+    monkeypatch.setattr(executor.ctypes, "CDLL", lambda *args, **kwargs: FakeLibC())
+    monkeypatch.setattr(
+        executor.resource,
+        "setrlimit",
+        lambda resource_id, value: calls.append((resource_id, value)),
+    )
+
+    executor._limit_child(SandboxLimits(), enforce_process_limit=False)
+    applied_resources = {resource_id for resource_id, _ in calls}
+    assert resource.RLIMIT_AS in applied_resources
+    assert resource.RLIMIT_FSIZE in applied_resources
+    assert resource.RLIMIT_CPU in applied_resources
+    assert resource.RLIMIT_NOFILE in applied_resources
+    assert resource.RLIMIT_NPROC not in applied_resources
+
+
+def test_procfs_pid_mapping_and_child_scan_work_in_nested_pid_namespace() -> None:
+    procfs_self = executor._procfs_self_pid()
+    assert executor._local_pid_from_procfs(procfs_self) == os.getpid()
+
+    child = subprocess.Popen(
+        ["/bin/sleep", "10"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.monotonic() + 2
+        candidates: set[int] = set()
+        while time.monotonic() < deadline:
+            candidates = executor._direct_child_pids(procfs_self)
+            if any(
+                executor._local_pid_from_procfs(pid) == child.pid
+                for pid in candidates
+            ):
+                break
+            time.sleep(0.01)
+        assert any(
+            executor._local_pid_from_procfs(pid) == child.pid
+            for pid in candidates
+        )
+    finally:
+        child.kill()
+        child.wait()
+
+
+def test_root_supervisor_preserves_root_identity_and_working_directory() -> None:
+    if os.geteuid() != 0 or not _is_ubuntu():
+        pytest.skip("真实 ROOT 执行测试需要 Ubuntu root 环境")
+
+    result = asyncio.run(
+        run_root_command(
+            "printf '%s:' \"$PWD\"; id -u",
+            SandboxLimits(timeout_seconds=5),
+            requested_timeout=5,
+        )
+    )
+    assert result.exit_code == 0, result.stderr
+    assert result.stdout == "/root:0\n"
+    assert result.timed_out is False
+
+
+def test_root_timeout_kills_detached_background_descendant(tmp_path: Path) -> None:
+    if os.geteuid() != 0 or not _is_ubuntu():
+        pytest.skip("真实 ROOT 超时清理测试需要 Ubuntu root 环境")
+
+    marker = tmp_path / "detached-timeout-escaped"
+    background = f"sleep 2; printf escaped > {shlex.quote(str(marker))}"
+    command = (
+        f"setsid /bin/bash -c {shlex.quote(background)} >/dev/null 2>&1 & "
+        "sleep 30"
+    )
+    started = time.monotonic()
+    result = asyncio.run(
+        run_unrestricted_root_command(
+            command,
+            SandboxLimits(timeout_seconds=1),
+            requested_timeout=1,
+        )
+    )
+    elapsed = time.monotonic() - started
+
+    assert result.exit_code == 124
+    assert result.timed_out is True
+    assert elapsed < 8
+    time.sleep(2.5)
+    assert not marker.exists()
+
+
+def test_root_completion_cleans_detached_background_descendant(tmp_path: Path) -> None:
+    if os.geteuid() != 0 or not _is_ubuntu():
+        pytest.skip("真实 ROOT 后台清理测试需要 Ubuntu root 环境")
+
+    marker = tmp_path / "detached-completion-escaped"
+    background = f"sleep 2; printf escaped > {shlex.quote(str(marker))}"
+    command = (
+        f"setsid /bin/bash -c {shlex.quote(background)} >/dev/null 2>&1 & "
+        "printf done"
+    )
+    result = asyncio.run(
+        run_unrestricted_root_command(
+            command,
+            SandboxLimits(timeout_seconds=5),
+            requested_timeout=5,
+        )
+    )
+
+    assert result.exit_code == 0, result.stderr
+    assert result.stdout == "done"
+    time.sleep(2.5)
+    assert not marker.exists()
+
+
+def test_real_bwrap_low_privilege_execution_when_requested(tmp_path: Path) -> None:
+    if os.environ.get("MAIBOT_BWRAP_INTEGRATION") != "1":
+        pytest.skip("设置 MAIBOT_BWRAP_INTEGRATION=1 后运行真实 Bubblewrap 集成测试")
+    if not _is_ubuntu():
+        pytest.fail("真实 Bubblewrap 集成测试要求 Ubuntu")
+    if shutil.which("bwrap") is None:
+        pytest.fail("真实 Bubblewrap 集成测试缺少 bubblewrap")
+
+    identity = resolve_execution_identity()
+    sandbox = prepare_sandbox(tmp_path, identity)
+    result = asyncio.run(
+        executor.run_command(
+            "pwd; id -u; printf sandbox-ok > integration.txt; test ! -e /root",
+            sandbox,
+            SandboxLimits(timeout_seconds=10),
+            requested_timeout=10,
+            network_enabled=False,
+        )
+    )
+
+    assert result.exit_code == 0, result.stderr
+    assert result.stdout.splitlines() == ["/work", str(identity.uid)]
+    assert (sandbox / "integration.txt").read_text(encoding="utf-8") == "sandbox-ok"
 
 
 def test_os_check_returns_boolean() -> None:

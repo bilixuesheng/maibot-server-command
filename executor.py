@@ -12,6 +12,8 @@ import resource
 import shutil
 import signal
 import stat
+import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -25,6 +27,8 @@ ABSOLUTE_MAX_FILE_SIZE_MB: Final = 1_024
 ABSOLUTE_MAX_PROCESSES: Final = 128
 ROOT_SANDBOX_USER: Final = "nobody"
 ROOT_WORKING_DIRECTORY: Final = Path("/root")
+ROOT_SUPERVISOR_FLAG: Final = "--maibot-root-supervisor"
+ROOT_SUPERVISOR_GRACE_SECONDS: Final = 5.0
 
 
 _HIGH_RISK_COMMAND_RULES: Final = (
@@ -263,7 +267,7 @@ def prepare_sandbox(
 
 
 def validate_sandbox_contents(sandbox: Path) -> None:
-    """Reject pre-existing host links and special files before bind-mounting."""
+    """Reject hard links and special files before bind-mounting the sandbox."""
 
     for directory, dir_names, file_names in os.walk(sandbox, followlinks=False):
         base = Path(directory)
@@ -463,7 +467,11 @@ def _is_ubuntu() -> bool:
         return False
 
 
-def _limit_child(limits: SandboxLimits) -> None:
+def _limit_child(
+    limits: SandboxLimits,
+    *,
+    enforce_process_limit: bool = True,
+) -> None:
     """Apply inherited Unix resource limits immediately before exec."""
 
     libc = ctypes.CDLL(None, use_errno=True)
@@ -478,7 +486,11 @@ def _limit_child(limits: SandboxLimits) -> None:
     resource.setrlimit(resource.RLIMIT_FSIZE, (file_size, file_size))
     resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds))
     resource.setrlimit(resource.RLIMIT_NOFILE, (128, 128))
-    resource.setrlimit(resource.RLIMIT_NPROC, (limits.max_processes, limits.max_processes))
+    if enforce_process_limit:
+        resource.setrlimit(
+            resource.RLIMIT_NPROC,
+            (limits.max_processes, limits.max_processes),
+        )
 
 
 def _prepare_bwrap(limits: SandboxLimits) -> None:
@@ -501,6 +513,260 @@ async def _capture_stream(
             shared_budget[0] -= len(kept)
         if len(chunk) > remaining:
             truncated[0] = True
+
+
+def _set_child_subreaper() -> None:
+    """Keep daemonized descendants attached to the dedicated root supervisor."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    pr_set_child_subreaper = 36
+    if libc.prctl(pr_set_child_subreaper, 1, 0, 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), "无法启用 root 子进程监督器")
+
+
+def _read_proc_pid_and_parent(stat_file: Path) -> tuple[int, int] | None:
+    try:
+        contents = stat_file.read_text(encoding="ascii")
+    except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+        return None
+    command_end = contents.rfind(")")
+    if command_end < 0:
+        return None
+    try:
+        pid = int(contents[: contents.index(" ")])
+        fields_after_command = contents[command_end + 2 :].split()
+        parent_pid = int(fields_after_command[1])
+    except (ValueError, IndexError):
+        return None
+    return pid, parent_pid
+
+
+def _procfs_self_pid() -> int:
+    """Return the PID used by this /proc mount, accounting for nested PID namespaces."""
+
+    values = _read_proc_pid_and_parent(Path("/proc/self/stat"))
+    if values is None:
+        return os.getpid()
+    return values[0]
+
+
+def _procfs_namespace_pids(procfs_pid: int) -> list[int]:
+    status_file = Path(f"/proc/{procfs_pid}/status")
+    try:
+        for line in status_file.read_text(encoding="ascii").splitlines():
+            if line.startswith("NSpid:"):
+                return [int(value) for value in line.split()[1:]]
+    except (FileNotFoundError, PermissionError, ProcessLookupError, OSError, ValueError):
+        pass
+    return []
+
+
+def _local_pid_from_procfs(procfs_pid: int) -> int:
+    """Translate a procfs PID into the PID visible from the caller's namespace."""
+
+    target_namespace_pids = _procfs_namespace_pids(procfs_pid)
+    caller_namespace_depth = len(_procfs_namespace_pids(_procfs_self_pid()))
+    if target_namespace_pids and caller_namespace_depth > 0:
+        index = min(caller_namespace_depth, len(target_namespace_pids)) - 1
+        return target_namespace_pids[index]
+    return procfs_pid
+
+
+def _direct_child_pids(parent_pid: int) -> set[int]:
+    """Scan procfs for direct children without relying on task/children support."""
+
+    children: set[int] = set()
+    try:
+        entries = Path("/proc").iterdir()
+    except OSError:
+        return children
+    for entry in entries:
+        if not entry.name.isdecimal():
+            continue
+        values = _read_proc_pid_and_parent(entry / "stat")
+        if values is not None and values[1] == parent_pid:
+            children.add(values[0])
+    return children
+
+
+def _descendant_pids(parent_pid: int) -> set[int]:
+    """Return every currently visible descendant, including new sessions."""
+
+    descendants: set[int] = set()
+    pending = list(_direct_child_pids(parent_pid))
+    while pending:
+        pid = pending.pop()
+        if pid in descendants:
+            continue
+        descendants.add(pid)
+        pending.extend(_direct_child_pids(pid) - descendants)
+    return descendants
+
+
+def _signal_pids(pids: set[int], sig: signal.Signals) -> None:
+    for procfs_pid in sorted(pids, reverse=True):
+        try:
+            os.kill(_local_pid_from_procfs(procfs_pid), sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def _reap_children_nonblocking() -> None:
+    while True:
+        try:
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if pid == 0:
+            return
+
+
+def _kill_supervised_descendants(supervisor_pid: int) -> None:
+    """Freeze, kill and reap all descendants, even after setsid/double-fork."""
+
+    for _ in range(20):
+        descendants = _descendant_pids(supervisor_pid)
+        if not descendants:
+            _reap_children_nonblocking()
+            if not _direct_child_pids(supervisor_pid):
+                return
+            time.sleep(0.01)
+            continue
+
+        # Freeze first so a process cannot race cleanup by repeatedly forking.
+        _signal_pids(descendants, signal.SIGSTOP)
+        time.sleep(0.01)
+        descendants.update(_descendant_pids(supervisor_pid))
+        _signal_pids(descendants, signal.SIGSTOP)
+        _signal_pids(descendants, signal.SIGKILL)
+        _reap_children_nonblocking()
+        time.sleep(0.01)
+
+    # Best-effort final sweep. A deliberately hostile unrestricted-root command
+    # can attack any host-side mechanism, but ordinary detached descendants are
+    # still terminated deterministically by the supervised lifecycle.
+    _signal_pids(_descendant_pids(supervisor_pid), signal.SIGKILL)
+    _reap_children_nonblocking()
+
+
+def _wait_status_to_exit_code(status: int) -> int:
+    if os.WIFEXITED(status):
+        return os.WEXITSTATUS(status)
+    if os.WIFSIGNALED(status):
+        return 128 + os.WTERMSIG(status)
+    return 1
+
+
+def _root_supervisor_main(command: str, limits: SandboxLimits) -> int:
+    """Supervise one root shell and clean every descendant before returning."""
+
+    _set_child_subreaper()
+    termination_requested = False
+
+    def request_termination(signum: int, frame: object) -> None:
+        del signum, frame
+        nonlocal termination_requested
+        termination_requested = True
+
+    signal.signal(signal.SIGTERM, request_termination)
+    signal.signal(signal.SIGINT, request_termination)
+
+    primary_pid = os.fork()
+    if primary_pid == 0:
+        try:
+            os.setsid()
+            _limit_child(limits, enforce_process_limit=False)
+            os.chdir(ROOT_WORKING_DIRECTORY)
+            environment = {
+                "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "HOME": "/root",
+                "USER": "root",
+                "LOGNAME": "root",
+                "LANG": "C.UTF-8",
+            }
+            os.execve(
+                "/bin/bash",
+                ["/bin/bash", "--noprofile", "--norc", "-c", command],
+                environment,
+            )
+        except BaseException as exc:
+            message = f"无法启动 root Bash：{exc}\n".encode("utf-8", errors="replace")
+            try:
+                os.write(2, message)
+            finally:
+                os._exit(126)
+
+    primary_status: int | None = None
+    while primary_status is None and not termination_requested:
+        try:
+            pid, status = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            break
+        if pid == 0:
+            time.sleep(0.02)
+            continue
+        if pid == primary_pid:
+            primary_status = status
+
+    _kill_supervised_descendants(_procfs_self_pid())
+    if termination_requested:
+        return 124
+    if primary_status is None:
+        return 1
+    return _wait_status_to_exit_code(primary_status)
+
+
+def _parse_root_supervisor_args(argv: list[str]) -> tuple[str, SandboxLimits]:
+    if len(argv) != 8 or argv[1] != ROOT_SUPERVISOR_FLAG:
+        raise ValueError("root supervisor 参数无效")
+    limits = SandboxLimits(
+        timeout_seconds=int(argv[2]),
+        max_output_bytes=int(argv[3]),
+        memory_limit_mb=int(argv[4]),
+        file_size_limit_mb=int(argv[5]),
+        max_processes=int(argv[6]),
+    ).normalized()
+    return argv[7], limits
+
+
+async def _stop_root_supervisor(process: asyncio.subprocess.Process) -> None:
+    """Ask the supervisor to clean descendants, with a hard fallback."""
+
+    try:
+        process.terminate()
+    except ProcessLookupError:
+        await process.wait()
+        return
+
+    try:
+        await asyncio.wait_for(
+            process.wait(),
+            timeout=ROOT_SUPERVISOR_GRACE_SECONDS,
+        )
+        return
+    except TimeoutError:
+        pass
+
+    # The supervisor normally exits in milliseconds. If it does not, clean the
+    # visible tree from the MaiBot parent before killing the supervisor itself.
+    procfs_self = _procfs_self_pid()
+    supervisor_candidates = {
+        pid
+        for pid in _direct_child_pids(procfs_self)
+        if _local_pid_from_procfs(pid) == process.pid
+    }
+    descendants: set[int] = set()
+    for supervisor_pid in supervisor_candidates:
+        descendants.update(_descendant_pids(supervisor_pid))
+    _signal_pids(descendants, signal.SIGSTOP)
+    for supervisor_pid in supervisor_candidates:
+        descendants.update(_descendant_pids(supervisor_pid))
+    _signal_pids(descendants, signal.SIGKILL)
+    try:
+        process.kill()
+    except ProcessLookupError:
+        pass
+    await process.wait()
 
 
 async def run_command(
@@ -619,27 +885,28 @@ async def _run_root_command(
     if requested_timeout is not None:
         timeout = max(1, min(int(requested_timeout), timeout))
 
-    environment = {
-        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-        "HOME": "/root",
-        "USER": "root",
-        "LOGNAME": "root",
-        "LANG": "C.UTF-8",
-    }
+    supervisor_path = str(Path(__file__).resolve(strict=True))
     process = await asyncio.create_subprocess_exec(
-        "/bin/bash",
-        "--noprofile",
-        "--norc",
-        "-c",
+        sys.executable,
+        supervisor_path,
+        ROOT_SUPERVISOR_FLAG,
+        str(normalized.timeout_seconds),
+        str(normalized.max_output_bytes),
+        str(normalized.memory_limit_mb),
+        str(normalized.file_size_limit_mb),
+        str(normalized.max_processes),
         command,
         cwd=str(ROOT_WORKING_DIRECTORY),
-        env=environment,
+        env={
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "HOME": "/root",
+            "LANG": "C.UTF-8",
+        },
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         close_fds=True,
         start_new_session=True,
-        preexec_fn=lambda: _limit_child(normalized),
     )
     assert process.stdout is not None
     assert process.stderr is not None
@@ -657,11 +924,7 @@ async def _run_root_command(
         await asyncio.wait_for(process.wait(), timeout=timeout)
     except TimeoutError:
         timed_out = True
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        await process.wait()
+        await _stop_root_supervisor(process)
     finally:
         await asyncio.gather(*readers)
 
@@ -709,3 +972,14 @@ async def run_unrestricted_root_command(
         requested_timeout=requested_timeout,
         enforce_high_risk_guard=False,
     )
+
+
+if __name__ == "__main__":
+    try:
+        supervised_command, supervised_limits = _parse_root_supervisor_args(sys.argv)
+        raise SystemExit(_root_supervisor_main(supervised_command, supervised_limits))
+    except BaseException as exc:
+        if isinstance(exc, SystemExit):
+            raise
+        print(f"root supervisor 启动失败：{exc}", file=sys.stderr)
+        raise SystemExit(126)

@@ -29,7 +29,7 @@ def test_factory_and_tool_declaration() -> None:
 
 def test_default_configuration_is_enabled_and_bounded() -> None:
     config = ServerCommandPlugin.build_default_config()
-    assert config["plugin"]["config_version"] == "1.0.11"
+    assert config["plugin"]["config_version"] == "1.0.12"
     assert config["sandbox"]["enabled"] is True
     assert config["sandbox"]["network_enabled"] is False
     assert config["sandbox"]["timeout_seconds"] == 20
@@ -51,7 +51,7 @@ def test_default_configuration_is_enabled_and_bounded() -> None:
 def test_sdk_can_normalize_and_inject_default_configuration() -> None:
     plugin = create_plugin()
     plugin.set_plugin_config({})
-    assert plugin.config.plugin.config_version == "1.0.11"
+    assert plugin.config.plugin.config_version == "1.0.12"
     assert plugin.config.sandbox.enabled is True
 
 
@@ -70,7 +70,7 @@ def test_manifest_is_v2_and_matches_plugin_version() -> None:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["manifest_version"] == 2
     assert manifest["id"] == "xuesheng.maibot-server-command"
-    assert manifest["version"] == "1.0.11"
+    assert manifest["version"] == "1.0.12"
     assert manifest["name"] == "服务器命令执行"
     assert manifest["description"] == (
         "让 MaiBot 在低权限沙箱中运行 Ubuntu 命令，并提供可选 ROOT 最高权限模式"
@@ -95,7 +95,7 @@ def test_webui_schema_uses_chinese_labels_and_hints() -> None:
     schema = create_plugin().get_webui_config_schema(
         plugin_id="xuesheng.maibot-server-command",
         plugin_name="服务器命令执行",
-        plugin_version="1.0.11",
+        plugin_version="1.0.12",
     )
     assert schema["sections"]["plugin"]["title"] == "插件信息"
     assert schema["sections"]["sandbox"]["title"] == "命令沙箱"
@@ -116,7 +116,8 @@ def test_webui_schema_uses_chinese_labels_and_hints() -> None:
     assert sandbox_fields["max_output_bytes"]["label"] == "最大输出大小（字节）"
     assert sandbox_fields["memory_limit_mb"]["label"] == "内存上限（MB）"
     assert sandbox_fields["file_size_limit_mb"]["label"] == "单文件大小上限（MB）"
-    assert sandbox_fields["max_processes"]["label"] == "最大进程数"
+    assert sandbox_fields["max_processes"]["label"] == "低权限沙箱最大进程数"
+    assert "两种 ROOT 模式不应用此项" in sandbox_fields["max_processes"]["hint"]
     assert sandbox_fields["network_enabled"]["ui_type"] == "switch"
     assert sandbox_fields["timeout_seconds"]["ui_type"] == "number"
     network_hint = sandbox_fields["network_enabled"]["hint"]
@@ -141,7 +142,7 @@ def test_root_mode_requires_root_and_every_confirmation(monkeypatch) -> None:
     plugin = create_plugin()
     plugin.set_plugin_config(
         {
-            "plugin": {"config_version": "1.0.11"},
+            "plugin": {"config_version": "1.0.12"},
             "root_mode": {
                 "enabled": True,
                 "confirmation_1": True,
@@ -190,7 +191,7 @@ def test_unrestricted_root_requires_restricted_root_and_all_ten_confirmations(
     plugin = create_plugin()
     plugin.set_plugin_config(
         {
-            "plugin": {"config_version": "1.0.11"},
+            "plugin": {"config_version": "1.0.12"},
             "root_mode": {
                 "enabled": True,
                 "confirmation_1": True,
@@ -254,7 +255,7 @@ def test_each_unrestricted_root_confirmation_is_required(
     unrestricted[field] = wrong_value
     plugin.set_plugin_config(
         {
-            "plugin": {"config_version": "1.0.11"},
+            "plugin": {"config_version": "1.0.12"},
             "root_mode": {
                 "enabled": True,
                 "confirmation_1": True,
@@ -289,6 +290,8 @@ def test_root_result_explicitly_warns_maimai_about_highest_privilege() -> None:
     assert payload["execution_mode"] == "root_restricted"
     assert payload["command_regex_guard"] == "enabled"
     assert payload["working_directory"] == "/root"
+    assert payload["process_limit"] == "not_enforced_for_uid_0"
+    assert payload["descendant_cleanup"] == "on_command_exit_or_timeout"
 
 
 def test_unrestricted_root_result_explicitly_reports_disabled_regex_guard() -> None:
@@ -306,13 +309,15 @@ def test_unrestricted_root_result_explicitly_reports_disabled_regex_guard() -> N
     assert payload["execution_mode"] == "root_unrestricted"
     assert payload["command_regex_guard"] == "disabled"
     assert payload["working_directory"] == "/root"
+    assert payload["process_limit"] == "not_enforced_for_uid_0"
+    assert payload["descendant_cleanup"] == "on_command_exit_or_timeout"
 
 
 def test_unrestricted_handler_does_not_call_high_risk_regex_guard(monkeypatch) -> None:
     plugin = create_plugin()
     plugin.set_plugin_config(
         {
-            "plugin": {"config_version": "1.0.11"},
+            "plugin": {"config_version": "1.0.12"},
             "root_mode": {
                 "enabled": True,
                 "confirmation_1": True,
@@ -362,7 +367,7 @@ def test_runner_style_file_loading_finds_sibling_executor(tmp_path: Path) -> Non
         "plugin = module.create_plugin()\n"
         "assert plugin.__class__.__name__ == 'ServerCommandPlugin'\n"
         "plugin.set_plugin_config({})\n"
-        "assert plugin.config.plugin.config_version == '1.0.11'\n"
+        "assert plugin.config.plugin.config_version == '1.0.12'\n"
     )
     completed = subprocess.run(
         [sys.executable, "-I", "-c", script],

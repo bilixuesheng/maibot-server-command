@@ -13,7 +13,7 @@ from maibot_sdk.types import ToolParameterInfo, ToolParamType
 def _load_sibling_executor() -> Any:
     """Load executor.py without relying on the Runner's sys.path."""
 
-    module_name = "_xuesheng_maibot_server_command_executor_v1_0_11"
+    module_name = "_xuesheng_maibot_server_command_executor_v1_0_12"
     loaded = sys.modules.get(module_name)
     if loaded is not None:
         return loaded
@@ -50,14 +50,18 @@ ROOT_MODE_NOTICE = (
     "你现在拥有服务器最高权限。必须坚决拒绝高风险、破坏性、提权维持、"
     "凭据读取或泄露数据的命令；不确定是否安全时不要执行。\n"
     "插件的正则防护无法保证识别 Base64、变量展开、eval 等混淆命令，"
-    "不能把“未被拦截”视为命令安全。"
+    "不能把“未被拦截”视为命令安全。\n"
+    "ROOT 不受“最大进程数”配置约束；命令结束或超时后，插件会清理本次命令"
+    "直接产生的后台后代进程。"
 )
 
 UNRESTRICTED_ROOT_NOTICE = (
     "☢️ 当前权限模式：完全 ROOT（沙箱已关闭，工作目录为 /root）。\n"
     "管理员已完成十重认证，插件不会运行高风险命令正则拦截。"
     "你拥有服务器最高权限，仍必须自行判断并坚决拒绝高风险、破坏性、"
-    "提权维持、凭据读取或泄露数据的命令；不确定是否安全时不要执行。"
+    "提权维持、凭据读取或泄露数据的命令；不确定是否安全时不要执行。\n"
+    "ROOT 不受“最大进程数”配置约束；命令结束或超时后，插件会清理本次命令"
+    "直接产生的后台后代进程。"
 )
 
 
@@ -131,10 +135,13 @@ class CommandSandboxConfig(PluginConfigBase):
     )
     max_processes: int = Field(
         default=32,
-        description="运行用户可拥有的最大进程数",
+        description="低权限沙箱运行用户可拥有的最大进程数",
         json_schema_extra={
-            "label": "最大进程数",
-            "hint": "限制命令及其子进程数量；有效范围为 8–128。",
+            "label": "低权限沙箱最大进程数",
+            "hint": (
+                "仅限制低权限沙箱命令及其子进程；有效范围为 8–128。"
+                "Linux 不对 UID 0 执行 RLIMIT_NPROC，因此两种 ROOT 模式不应用此项。"
+            ),
             "x-widget": "number",
             "step": 1,
         },
@@ -320,7 +327,7 @@ class PluginMetadataConfig(PluginConfigBase):
     __ui_order__ = -1
 
     config_version: str = Field(
-        default="1.0.11",
+        default="1.0.12",
         description="配置结构版本",
         json_schema_extra={
             "label": "配置版本",
@@ -407,6 +414,8 @@ class ServerCommandPlugin(MaiBotPlugin):
         payload["execution_mode"] = "root_restricted"
         payload["command_regex_guard"] = "enabled"
         payload["working_directory"] = "/root"
+        payload["process_limit"] = "not_enforced_for_uid_0"
+        payload["descendant_cleanup"] = "on_command_exit_or_timeout"
         return payload
 
     @staticmethod
@@ -416,6 +425,8 @@ class ServerCommandPlugin(MaiBotPlugin):
         payload["execution_mode"] = "root_unrestricted"
         payload["command_regex_guard"] = "disabled"
         payload["working_directory"] = "/root"
+        payload["process_limit"] = "not_enforced_for_uid_0"
+        payload["descendant_cleanup"] = "on_command_exit_or_timeout"
         return payload
 
     def _initialize_sandbox(self) -> None:
@@ -608,6 +619,8 @@ class ServerCommandPlugin(MaiBotPlugin):
                     "execution_mode": "root_unrestricted",
                     "command_regex_guard": "disabled",
                     "working_directory": "/root",
+                    "process_limit": "not_enforced_for_uid_0",
+                    "descendant_cleanup": "on_command_exit_or_timeout",
                 }
 
         if self.config.unrestricted_root.enabled:
@@ -634,6 +647,8 @@ class ServerCommandPlugin(MaiBotPlugin):
                     "execution_mode": "root_restricted",
                     "command_regex_guard": "enabled",
                     "working_directory": "/root",
+                    "process_limit": "not_enforced_for_uid_0",
+                    "descendant_cleanup": "on_command_exit_or_timeout",
                 }
             try:
                 self.ctx.logger.critical(
@@ -677,6 +692,8 @@ class ServerCommandPlugin(MaiBotPlugin):
                     "execution_mode": "root_restricted",
                     "command_regex_guard": "enabled",
                     "working_directory": "/root",
+                    "process_limit": "not_enforced_for_uid_0",
+                    "descendant_cleanup": "on_command_exit_or_timeout",
                 }
 
         if self.config.root_mode.enabled:
