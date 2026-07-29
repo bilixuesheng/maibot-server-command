@@ -4,19 +4,29 @@ import asyncio
 import contextlib
 import importlib.util
 import os
+import re
 import secrets
 import sys
 from pathlib import Path
 from typing import Any
 
-from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF, Field, MaiBotPlugin, PluginConfigBase, Tool
+from pydantic import field_validator
+
+from maibot_sdk import (
+    CONFIG_RELOAD_SCOPE_SELF,
+    Action,
+    Field,
+    MaiBotPlugin,
+    PluginConfigBase,
+    Tool,
+)
 from maibot_sdk.types import ToolParameterInfo, ToolParamType
 
 
 def _load_sibling_executor() -> Any:
     """Load executor.py without relying on the Runner's sys.path."""
 
-    module_name = "_xuesheng_maibot_server_command_executor_v1_0_14"
+    module_name = "_xuesheng_maibot_server_command_executor_v1_0_15"
     loaded = sys.modules.get(module_name)
     if loaded is not None:
         return loaded
@@ -39,7 +49,7 @@ def _load_sibling_executor() -> Any:
 def _load_sibling_file_upload() -> Any:
     """Load file_upload.py without relying on the Runner's sys.path."""
 
-    module_name = "_xuesheng_maibot_server_command_file_upload_v1_0_14"
+    module_name = "_xuesheng_maibot_server_command_file_upload_v1_0_15"
     loaded = sys.modules.get(module_name)
     if loaded is not None:
         return loaded
@@ -62,7 +72,7 @@ def _load_sibling_file_upload() -> Any:
 def _load_sibling_temp_cleanup() -> Any:
     """Load temp_cleanup.py without relying on the Runner's sys.path."""
 
-    module_name = "_xuesheng_maibot_server_command_temp_cleanup_v1_0_14"
+    module_name = "_xuesheng_maibot_server_command_temp_cleanup_v1_0_15"
     loaded = sys.modules.get(module_name)
     if loaded is not None:
         return loaded
@@ -96,7 +106,13 @@ run_command = _executor.run_command
 run_root_command = _executor.run_root_command
 run_unrestricted_root_command = _executor.run_unrestricted_root_command
 FileUploadError = _file_upload.FileUploadError
+StagingCleanupReport = _file_upload.StagingCleanupReport
+cleanup_stale_local_uploads = _file_upload.cleanup_stale_local_uploads
+delete_local_staging_file = _file_upload.delete_local_staging_file
+ensure_local_staging_root = _file_upload.ensure_local_staging_root
+find_existing_local_staging_root = _file_upload.find_existing_local_staging_root
 prepare_file_upload = _file_upload.prepare_file_upload
+verify_local_staging_file = _file_upload.verify_local_staging_file
 CleanupReport = _temp_cleanup.CleanupReport
 CLEANUP_INTERVAL_SECONDS = _temp_cleanup.CLEANUP_INTERVAL_SECONDS
 ManagedTempTask = _temp_cleanup.ManagedTempTask
@@ -109,6 +125,14 @@ is_managed_task_name = _temp_cleanup.is_managed_task_name
 reuse_managed_temp_task = _temp_cleanup.reuse_managed_temp_task
 
 TEMP_SESSION_IDLE_SECONDS = 30 * 60
+_QQ_USER_ID_RE = re.compile(r"[1-9][0-9]{4,19}\Z")
+_MAX_TRUSTED_QQ_USERS = 64
+_TRUSTED_ACTION_NAMES = frozenset(
+    {
+        "run_trusted_private_server_command",
+        "send_trusted_private_server_file",
+    }
+)
 
 
 ROOT_MODE_NOTICE = (
@@ -132,6 +156,15 @@ UNRESTRICTED_ROOT_NOTICE = (
     "不得上传、改名、打包或编码任何敏感数据。\n"
     "ROOT 不受“最大进程数”配置约束；命令结束或超时后，插件会清理本次命令"
     "直接产生的后台后代进程。"
+)
+
+TRUSTED_PRIVATE_NOTICE = (
+    "☢️ 当前权限模式：可信 QQ 私聊完全绕过（工作目录为 /root）。\n"
+    "当前 Action 的真实 MaiBot 聊天流已反查为管理员白名单内的 QQ 私聊。"
+    "插件不会应用 Bubblewrap 沙箱、ROOT 确认项或高风险命令正则；"
+    "命令以 MaiBot 的 root 身份直接执行。超时、输出和资源上限仍然保留。\n"
+    "向当前同一私聊发送文件时，敏感路径、文件名与内容扫描也会关闭；"
+    "文件类型、符号链接、硬链接、读取竞态和大小上限仍然检查。"
 )
 
 
@@ -232,7 +265,8 @@ class FileUploadConfig(PluginConfigBase):
             "label": "启用 QQ 文件上传",
             "hint": (
                 "默认关闭。低权限模式只能读取 maibot-command-file；"
-                "ROOT 模式可读取全系统普通文件。敏感文件始终禁止上传。"
+                "ROOT 模式可读取全系统普通文件。通常会拒绝敏感文件；"
+                "另行启用的可信 QQ 私聊白名单可对同一私聊关闭敏感扫描。"
             ),
             "x-widget": "switch",
         },
@@ -247,6 +281,74 @@ class FileUploadConfig(PluginConfigBase):
             "hint": (
                 "默认 8 MiB，硬上限 10 MiB。文件会经过 Base64 封装，"
                 "该上限用于确保请求不超过 MaiBot 插件 IPC 帧限制。"
+            ),
+            "x-widget": "number",
+            "step": 1,
+        },
+    )
+    use_napcat_local_path: bool = Field(
+        default=False,
+        description="是否把文件复制到共享暂存目录后交给 NapCat 按本地路径读取",
+        json_schema_extra={
+            "label": "使用 NapCat 本地路径发送",
+            "hint": (
+                "默认关闭。开启后不再把文件正文塞进 Base64 IPC，可发送更大的文件。"
+                "MaiBot 与 NapCat 必须能看到同一份共享目录；Docker 部署需挂载共享卷。"
+            ),
+            "x-widget": "switch",
+        },
+    )
+    local_path_max_upload_mb: int = Field(
+        default=1024,
+        ge=1,
+        le=1024,
+        description="NapCat 本地路径发送的单文件上限（1–1024 MiB）",
+        json_schema_extra={
+            "label": "本地路径单文件上限（MiB）",
+            "hint": (
+                "仅在开启 NapCat 本地路径发送时生效；插件硬上限为 1024 MiB。"
+                "QQ 或 NapCat 仍可能有更低的平台限制。"
+            ),
+            "x-widget": "number",
+            "step": 1,
+        },
+    )
+    maibot_staging_directory: str = Field(
+        default="/tmp/maibot-napcat-file-staging",
+        max_length=4096,
+        description="MaiBot 进程写入共享暂存副本的绝对目录",
+        json_schema_extra={
+            "label": "MaiBot 暂存目录",
+            "hint": (
+                "必须是插件专用绝对目录。插件会创建随机只读副本；"
+                "不可填写 /、/tmp、/root 等非专用目录。"
+            ),
+            "x-widget": "text",
+        },
+    )
+    napcat_staging_directory: str = Field(
+        default="/tmp/maibot-napcat-file-staging",
+        max_length=4096,
+        description="同一共享目录在 NapCat 环境中可见的绝对路径",
+        json_schema_extra={
+            "label": "NapCat 可见暂存目录",
+            "hint": (
+                "同机同路径部署保持默认值；两个 Docker 容器可把同一共享卷"
+                "分别挂载到不同路径，并在这里填写 NapCat 容器内路径。"
+            ),
+            "x-widget": "text",
+        },
+    )
+    staging_retention_hours: int = Field(
+        default=24,
+        ge=1,
+        le=720,
+        description="发送结果不确定时暂存副本的保留时长（1–720 小时）",
+        json_schema_extra={
+            "label": "发送暂存保留时长（小时）",
+            "hint": (
+                "NapCat 明确发送成功后立即删除暂存副本；失败或结果不确定时保留，"
+                "到期后由插件每小时安全清理。"
             ),
             "x-widget": "number",
             "step": 1,
@@ -300,12 +402,47 @@ class TemporaryFileCleanupConfig(PluginConfigBase):
     )
 
 
+class TrustedPrivateBypassConfig(PluginConfigBase):
+    """Allow explicitly listed QQ private chats to bypass command and secret guards."""
+
+    __ui_label__ = "可信 QQ 私聊完全绕过（极高风险）"
+    __ui_icon__ = "badge-alert"
+    __ui_order__ = 3
+
+    enabled: bool = Field(
+        default=False,
+        description="是否允许白名单 QQ 私聊绕过沙箱、命令正则和敏感文件扫描",
+        json_schema_extra={
+            "label": "启用可信私聊完全绕过",
+            "hint": (
+                "默认关闭。开启后，白名单 QQ 私聊可直接以 MaiBot 的 root 身份执行任意命令；"
+                "向同一私聊发文件时不会检测密码、Token、私钥、Cookie、数据库等敏感内容。"
+                "MaiBot 必须由 root 用户运行。"
+            ),
+            "x-widget": "switch",
+        },
+    )
+    qq_user_ids: str = Field(
+        default="",
+        max_length=2048,
+        description="允许完全绕过的 QQ 用户号白名单",
+        json_schema_extra={
+            "label": "可信 QQ 号白名单",
+            "hint": (
+                "只填写私聊对方的 QQ 号，多个号码可用逗号、空格或换行分隔，最多 64 个。"
+                "群号无效；插件会用 Host 的私聊流反查真实 user_id，不相信模型传入的号码。"
+            ),
+            "x-widget": "textarea",
+        },
+    )
+
+
 class RootPrivilegeConfig(PluginConfigBase):
     """需要多重确认才能启用的受限 root 模式。"""
 
     __ui_label__ = "受限 ROOT（极高风险）"
     __ui_icon__ = "triangle-alert"
-    __ui_order__ = 3
+    __ui_order__ = 4
 
     enabled: bool = Field(
         default=False,
@@ -375,7 +512,7 @@ class UnrestrictedRootConfig(PluginConfigBase):
 
     __ui_label__ = "完全 ROOT（无命令正则拦截）"
     __ui_icon__ = "skull"
-    __ui_order__ = 4
+    __ui_order__ = 5
 
     enabled: bool = Field(
         default=False,
@@ -391,73 +528,73 @@ class UnrestrictedRootConfig(PluginConfigBase):
     )
     confirmation_1: bool = Field(
         default=False,
-        description="第一项认证",
+        description="确认理解完全 ROOT 会关闭命令沙箱",
         json_schema_extra={
-            "label": "认证 1：开启",
-            "hint": "完全 ROOT 的第一项认证必须开启。",
+            "label": "认证 1：我明白命令将不再受到文件系统沙箱限制",
+            "hint": "请根据这句话是否符合你的真实理解选择，不要连续点击所有开关。",
             "x-widget": "switch",
         },
     )
     confirmation_2: bool = Field(
         default=False,
-        description="第二项认证",
+        description="确认理解完全 ROOT 会关闭高风险命令正则拦截",
         json_schema_extra={
-            "label": "认证 2：开启",
-            "hint": "完全 ROOT 的第二项认证必须开启。",
+            "label": "认证 2：我明白高风险命令不会再被命令正则拒绝",
+            "hint": "请根据这句话是否符合你的真实理解选择，不要连续点击所有开关。",
             "x-widget": "switch",
         },
     )
     confirmation_3: bool = Field(
         default=False,
-        description="第三项认证",
+        description="确认理解完全 ROOT 能修改或删除系统数据",
         json_schema_extra={
-            "label": "认证 3：开启",
-            "hint": "完全 ROOT 的第三项认证必须开启。",
+            "label": "认证 3：我明白错误命令可能修改或删除整台服务器的数据",
+            "hint": "请根据这句话是否符合你的真实理解选择，不要连续点击所有开关。",
             "x-widget": "switch",
         },
     )
     confirmation_4: bool = Field(
         default=False,
-        description="第四项认证",
+        description="确认理解完全 ROOT 能读取服务器敏感信息",
         json_schema_extra={
-            "label": "认证 4：开启",
-            "hint": "完全 ROOT 的第四项认证必须开启。",
+            "label": "认证 4：我明白命令可能读取密码、Token、私钥及其他敏感信息",
+            "hint": "请根据这句话是否符合你的真实理解选择，不要连续点击所有开关。",
             "x-widget": "switch",
         },
     )
     confirmation_5: bool = Field(
         default=False,
-        description="第五项认证",
+        description="确认已备份重要数据并愿意承担风险",
         json_schema_extra={
-            "label": "认证 5：开启",
-            "hint": "完全 ROOT 的第五项认证必须开启。",
+            "label": "认证 5：我已备份重要数据，并愿意承担启用后的全部风险",
+            "hint": "请根据这句话是否符合你的真实情况选择，不要连续点击所有开关。",
             "x-widget": "switch",
         },
     )
     confirmation_6: bool = Field(
-        default=True,
-        description="第六项认证；必须关闭",
+        default=False,
+        description="反向确认是否不明白完全 ROOT 会执行什么命令",
         json_schema_extra={
-            "label": "认证 6：关闭",
-            "hint": "此项默认开启，必须手动关闭。",
+            "label": "认证 6：我不明白完全 ROOT 可能执行什么命令",
+            "hint": "这是反向陈述，请根据这句话是否符合你的真实理解选择。",
             "x-widget": "switch",
         },
     )
     confirmation_7: bool = Field(
         default=False,
-        description="第七项认证；必须开启",
+        description="确认只在必要时主动启用完全 ROOT",
         json_schema_extra={
-            "label": "认证 7：开启",
-            "hint": "此项必须开启。",
+            "label": "认证 7：我确认这是我主动要求，并且只会在必要时启用",
+            "hint": "请根据这句话是否符合你的真实意图选择，不要连续点击所有开关。",
             "x-widget": "switch",
         },
     )
     confirmation_8: bool = Field(
-        default=True,
-        description="第八项认证；必须关闭",
+        default=False,
+        description="反向确认是否不明白完全 ROOT 可能发送或泄露什么数据",
         json_schema_extra={
-            "label": "认证 8：关闭",
-            "hint": "此项默认开启，必须手动关闭。",
+            "label": "认证 8：我不明白命令可能发送或泄露什么服务器数据",
+            "hint": "这是反向陈述，请根据这句话是否符合你的真实理解选择。",
             "x-widget": "switch",
         },
     )
@@ -473,15 +610,26 @@ class UnrestrictedRootConfig(PluginConfigBase):
             "step": 1,
         },
     )
-    confirmation_10: bool = Field(
-        default=True,
+    confirmation_10: str = Field(
+        default="true",
+        pattern=r"^(?:true|false)$",
         description="第十项认证；必须从 true 改为 false",
         json_schema_extra={
             "label": "认证 10：把 true 改成 false",
-            "hint": "此项默认开启（true），必须手动关闭为 false。",
-            "x-widget": "switch",
+            "hint": "这是文字输入框，默认值为 true；必须手动输入小写 false。",
+            "placeholder": "false",
+            "x-widget": "text",
         },
     )
+
+    @field_validator("confirmation_10", mode="before")
+    @classmethod
+    def _migrate_legacy_confirmation_10(cls, value: Any) -> Any:
+        """Accept only the exact bool values generated by the 1.0.14 switch."""
+
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        return value
 
 
 class PluginMetadataConfig(PluginConfigBase):
@@ -492,7 +640,7 @@ class PluginMetadataConfig(PluginConfigBase):
     __ui_order__ = -1
 
     config_version: str = Field(
-        default="1.0.14",
+        default="1.0.15",
         description="配置结构版本",
         json_schema_extra={
             "label": "配置版本",
@@ -511,6 +659,9 @@ class ServerCommandPluginConfig(PluginConfigBase):
     temp_cleanup: TemporaryFileCleanupConfig = Field(
         default_factory=TemporaryFileCleanupConfig
     )
+    trusted_private_bypass: TrustedPrivateBypassConfig = Field(
+        default_factory=TrustedPrivateBypassConfig
+    )
     root_mode: RootPrivilegeConfig = Field(default_factory=RootPrivilegeConfig)
     unrestricted_root: UnrestrictedRootConfig = Field(default_factory=UnrestrictedRootConfig)
 
@@ -528,9 +679,34 @@ class ServerCommandPlugin(MaiBotPlugin):
         self._managed_temp_root = None
         self._cleanup_task: asyncio.Task[None] | None = None
         self._cleanup_lock = asyncio.Lock()
+        self._staging_lock = asyncio.Lock()
         self._active_temp_tasks: dict[str, int] = {}
         self._known_temp_tasks: dict[str, tuple[ManagedTempTask, bool, float]] = {}
         self._stream_temp_tasks: dict[str, str] = {}
+        self._local_staging_root: Path | None = None
+        self._active_staging_uploads: set[tuple[str, str]] = set()
+        self._retired_staging_roots: set[str] = set()
+
+    def get_components(self) -> list[dict[str, Any]]:
+        """Promote Host-enforced scope and RPC timeouts out of SDK metadata."""
+
+        components = super().get_components()
+        for component in components:
+            metadata = component.get("metadata")
+            if not isinstance(metadata, dict):
+                continue
+            decorator_metadata = metadata.get("metadata")
+            raw_timeout = metadata.get("timeout_ms")
+            if raw_timeout is None and isinstance(decorator_metadata, dict):
+                raw_timeout = decorator_metadata.get("timeout_ms")
+            if raw_timeout is not None:
+                timeout_ms = int(raw_timeout)
+                component["timeout_ms"] = timeout_ms
+                metadata["timeout_ms"] = timeout_ms
+            if component.get("name") in _TRUSTED_ACTION_NAMES:
+                component["chat_scope"] = "private"
+                metadata["chat_scope"] = "private"
+        return components
 
     def _root_mode_state(self) -> tuple[bool, str]:
         settings = self.config.root_mode
@@ -579,7 +755,7 @@ class ServerCommandPlugin(MaiBotPlugin):
             missing.append("认证 8 未关闭")
         if int(settings.confirmation_9) != 0:
             missing.append("认证 9 未从 1 改为 0")
-        if settings.confirmation_10:
+        if str(settings.confirmation_10).strip().casefold() != "false":
             missing.append("认证 10 未从 true 改为 false")
         if missing:
             return False, "；".join(missing)
@@ -607,6 +783,18 @@ class ServerCommandPlugin(MaiBotPlugin):
         payload["descendant_cleanup"] = "on_command_exit_or_timeout"
         return payload
 
+    @staticmethod
+    def _trusted_private_result(result: Any) -> dict[str, object]:
+        payload = result.as_dict()
+        payload["content"] = f"{TRUSTED_PRIVATE_NOTICE}\n\n{payload['content']}"
+        payload["execution_mode"] = "trusted_private_unrestricted"
+        payload["command_regex_guard"] = "disabled_by_trusted_private"
+        payload["working_directory"] = "/root"
+        payload["process_limit"] = "not_enforced_for_uid_0"
+        payload["descendant_cleanup"] = "on_command_exit_or_timeout"
+        payload["trusted_private_bypass"] = True
+        return payload
+
     def _initialize_sandbox(self, *, low_privilege: bool | None = None) -> None:
         maibot_root = find_maibot_root(__file__)
         if low_privilege is None:
@@ -625,17 +813,17 @@ class ServerCommandPlugin(MaiBotPlugin):
         self._sandbox_error = ""
 
     async def _run_cleanup_once(self, trigger: str) -> CleanupReport:
-        if not self.config.temp_cleanup.enabled:
-            return CleanupReport()
-        async with self._cleanup_lock:
-            if self._sandbox_path is None or self._managed_temp_root is None:
-                await asyncio.to_thread(self._initialize_sandbox)
-            report = await asyncio.to_thread(
-                cleanup_expired_tasks,
-                self._sandbox_path,
-                retention_hours=self.config.temp_cleanup.retention_hours,
-                active_task_ids=tuple(self._active_temp_tasks),
-            )
+        report = CleanupReport()
+        if self.config.temp_cleanup.enabled:
+            async with self._cleanup_lock:
+                if self._sandbox_path is None or self._managed_temp_root is None:
+                    await asyncio.to_thread(self._initialize_sandbox)
+                report = await asyncio.to_thread(
+                    cleanup_expired_tasks,
+                    self._sandbox_path,
+                    retention_hours=self.config.temp_cleanup.retention_hours,
+                    active_task_ids=tuple(self._active_temp_tasks),
+                )
         if (
             report.deleted_tasks
             or report.deleted_entries
@@ -657,6 +845,64 @@ class ServerCommandPlugin(MaiBotPlugin):
                 report.errors,
                 report.budget_exhausted,
             )
+
+        staging_roots: set[str] = set(self._retired_staging_roots)
+        if self.config.file_upload.use_napcat_local_path:
+            if self._local_staging_root is None:
+                self._local_staging_root = await asyncio.to_thread(
+                    ensure_local_staging_root,
+                    self.config.file_upload.maibot_staging_directory,
+                )
+            staging_roots.add(os.fspath(self._local_staging_root))
+        async with self._staging_lock:
+            for root_text in sorted(staging_roots):
+                active_names = tuple(
+                    name
+                    for root, name in self._active_staging_uploads
+                    if root == root_text
+                )
+                try:
+                    staging_report: StagingCleanupReport = await asyncio.to_thread(
+                        cleanup_stale_local_uploads,
+                        Path(root_text),
+                        retention_hours=self.config.file_upload.staging_retention_hours,
+                        active_names=active_names,
+                    )
+                except Exception as exc:
+                    self.ctx.logger.error(
+                        "NapCat 共享暂存清理失败：trigger=%s error_type=%s",
+                        trigger,
+                        type(exc).__name__,
+                    )
+                    if root_text in self._retired_staging_roots and not active_names:
+                        self._retired_staging_roots.discard(root_text)
+                    continue
+                if (
+                    staging_report.deleted_files
+                    or staging_report.skipped_active
+                    or staging_report.skipped_unsafe
+                    or staging_report.errors
+                    or staging_report.budget_exhausted
+                ):
+                    self.ctx.logger.info(
+                        "NapCat 共享暂存清理完成：trigger=%s deleted_files=%s "
+                        "skipped_recent=%s skipped_active=%s skipped_unsafe=%s "
+                        "errors=%s remaining_files=%s budget_exhausted=%s",
+                        trigger,
+                        staging_report.deleted_files,
+                        staging_report.skipped_recent,
+                        staging_report.skipped_active,
+                        staging_report.skipped_unsafe,
+                        staging_report.errors,
+                        staging_report.remaining_files,
+                        staging_report.budget_exhausted,
+                    )
+                if (
+                    root_text in self._retired_staging_roots
+                    and staging_report.remaining_files == 0
+                    and not staging_report.budget_exhausted
+                ):
+                    self._retired_staging_roots.discard(root_text)
         return report
 
     async def _cleanup_loop(self) -> None:
@@ -664,11 +910,17 @@ class ServerCommandPlugin(MaiBotPlugin):
             await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
             try:
                 await self._run_cleanup_once("scheduled")
+                if (
+                    not self.config.temp_cleanup.enabled
+                    and not self.config.file_upload.use_napcat_local_path
+                    and not self._retired_staging_roots
+                ):
+                    return
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 self.ctx.logger.error(
-                    "受管临时文件定时清理失败：error_type=%s",
+                    "插件临时文件定时清理失败：error_type=%s",
                     type(exc).__name__,
                 )
 
@@ -689,21 +941,64 @@ class ServerCommandPlugin(MaiBotPlugin):
             await task
 
     async def _refresh_cleanup_service(self, *, run_now: bool) -> None:
+        local_enabled = bool(self.config.file_upload.use_napcat_local_path)
         if not self.config.temp_cleanup.enabled:
-            await self._stop_cleanup_loop()
             self._managed_temp_root = None
-            return
-        root_active, _ = self._root_mode_state()
-        low_privilege = not root_active
-        if (
-            self._sandbox_path is None
-            or self._managed_temp_root is None
-            or (low_privilege and not self._sandbox_prepared_for_low_privilege)
-        ):
-            await asyncio.to_thread(
-                self._initialize_sandbox,
-                low_privilege=low_privilege,
+        else:
+            root_active, _ = self._root_mode_state()
+            low_privilege = not root_active
+            if (
+                self._sandbox_path is None
+                or self._managed_temp_root is None
+                or (low_privilege and not self._sandbox_prepared_for_low_privilege)
+            ):
+                await asyncio.to_thread(
+                    self._initialize_sandbox,
+                    low_privilege=low_privilege,
+                )
+
+        if local_enabled:
+            configured_root = await asyncio.to_thread(
+                ensure_local_staging_root,
+                self.config.file_upload.maibot_staging_directory,
             )
+            async with self._staging_lock:
+                if (
+                    self._local_staging_root is not None
+                    and self._local_staging_root != configured_root
+                ):
+                    self._retired_staging_roots.add(
+                        os.fspath(self._local_staging_root)
+                    )
+                self._local_staging_root = configured_root
+        else:
+            existing_root: Path | None = None
+            try:
+                existing_root = await asyncio.to_thread(
+                    find_existing_local_staging_root,
+                    self.config.file_upload.maibot_staging_directory,
+                )
+            except FileUploadError:
+                self.ctx.logger.warning(
+                    "已关闭 NapCat 本地路径发送，且配置目录不是可安全接管的旧暂存目录；"
+                    "插件不会修改或清理该目录"
+                )
+            async with self._staging_lock:
+                if self._local_staging_root is not None:
+                    self._retired_staging_roots.add(
+                        os.fspath(self._local_staging_root)
+                    )
+                    self._local_staging_root = None
+                if existing_root is not None:
+                    self._retired_staging_roots.add(os.fspath(existing_root))
+
+        if (
+            not self.config.temp_cleanup.enabled
+            and not local_enabled
+            and not self._retired_staging_roots
+        ):
+            await self._stop_cleanup_loop()
+            return
         if run_now:
             await self._run_cleanup_once("startup_or_config")
         self._start_cleanup_loop()
@@ -872,17 +1167,191 @@ class ServerCommandPlugin(MaiBotPlugin):
                 active_task_ids=tuple(self._active_temp_tasks),
             )
 
+    async def _prepare_qq_upload(
+        self,
+        file_path: str,
+        *,
+        root_mode: bool,
+        upload_name: str | None,
+        sensitive_guard_enabled: bool,
+    ) -> Any:
+        """Prepare either the legacy Base64 payload or a pinned local-path copy."""
+
+        settings = self.config.file_upload
+        common_kwargs = {
+            "sandbox_root": self._sandbox_path,
+            "root_mode": root_mode,
+            "configured_max_mb": settings.max_upload_mb,
+            "upload_name": upload_name,
+            "managed_temp_root": self._managed_temp_root,
+            "sensitive_guard_enabled": sensitive_guard_enabled,
+        }
+        if not settings.use_napcat_local_path:
+            return await asyncio.to_thread(
+                prepare_file_upload,
+                file_path,
+                **common_kwargs,
+            )
+
+        configured_path = str(settings.maibot_staging_directory)
+        napcat_visible_path = str(settings.napcat_staging_directory)
+        configured_local_max_mb = int(settings.local_path_max_upload_mb)
+        async with self._staging_lock:
+            staging_root = await asyncio.to_thread(
+                ensure_local_staging_root,
+                configured_path,
+            )
+            if (
+                self._local_staging_root is not None
+                and self._local_staging_root != staging_root
+            ):
+                self._retired_staging_roots.add(
+                    os.fspath(self._local_staging_root)
+                )
+            self._local_staging_root = staging_root
+            prepared = await asyncio.to_thread(
+                prepare_file_upload,
+                file_path,
+                **common_kwargs,
+                transport="napcat_local",
+                configured_local_max_mb=configured_local_max_mb,
+                local_staging_root=staging_root,
+                napcat_staging_root=napcat_visible_path,
+            )
+            if prepared.staging_name and prepared.staging_root:
+                self._active_staging_uploads.add(
+                    (str(prepared.staging_root), str(prepared.staging_name))
+                )
+            return prepared
+
+    async def _finish_local_staging(self, prepared: Any, *, sent: bool) -> str:
+        """Delete a confirmed staging copy, or retain an uncertain one for TTL cleanup."""
+
+        staging_name = str(getattr(prepared, "staging_name", "") or "")
+        staging_root = str(getattr(prepared, "staging_root", "") or "")
+        staging_identity = getattr(prepared, "staging_identity", None)
+        if not staging_name or not staging_root or staging_identity is None:
+            return "not_applicable"
+        key = (staging_root, staging_name)
+        async with self._staging_lock:
+            try:
+                if not sent:
+                    return "staging_retained_send_unconfirmed"
+                return await asyncio.to_thread(
+                    delete_local_staging_file,
+                    Path(staging_root),
+                    staging_name=staging_name,
+                    expected_identity=staging_identity,
+                )
+            except Exception:
+                return "staging_cleanup_failed"
+            finally:
+                self._active_staging_uploads.discard(key)
+
+    async def _send_prepared_file(
+        self,
+        prepared: Any,
+        stream_id: str,
+    ) -> tuple[bool, str, str]:
+        """Send one prepared file and return explicit delivery/staging state."""
+
+        staging_name = str(getattr(prepared, "staging_name", "") or "")
+        staging_root = str(getattr(prepared, "staging_root", "") or "")
+        staging_identity = getattr(prepared, "staging_identity", None)
+        if staging_name and staging_root and staging_identity is not None:
+            try:
+                verification = await asyncio.to_thread(
+                    verify_local_staging_file,
+                    Path(staging_root),
+                    staging_name=staging_name,
+                    expected_identity=staging_identity,
+                )
+            except asyncio.CancelledError:
+                await asyncio.shield(
+                    self._finish_local_staging(prepared, sent=False)
+                )
+                raise
+            except Exception:
+                verification = "staging_verification_failed"
+            if verification != "staging_verified":
+                await self._finish_local_staging(prepared, sent=False)
+                return False, verification, "StagingVerificationFailed"
+
+        try:
+            send_result = await self.ctx.send.custom(
+                "file",
+                prepared.message_payload(),
+                stream_id,
+                storage_message=False,
+                show_log=False,
+                sync_to_maisaka_history=False,
+            )
+            confirmed_success = send_result is True or (
+                isinstance(send_result, dict) and send_result.get("success") is True
+            )
+            if not confirmed_success:
+                staging_status = await self._finish_local_staging(
+                    prepared,
+                    sent=False,
+                )
+                return False, staging_status, "UnconfirmedAdapterResult"
+        except asyncio.CancelledError:
+            await self._finish_local_staging(prepared, sent=False)
+            raise
+        except Exception as exc:
+            staging_status = await self._finish_local_staging(
+                prepared,
+                sent=False,
+            )
+            return False, staging_status, type(exc).__name__
+
+        staging_status = await self._finish_local_staging(prepared, sent=True)
+        return True, staging_status, ""
+
     async def on_load(self) -> None:
         root_active, root_reason = self._root_mode_state()
         unrestricted_active, unrestricted_reason = self._unrestricted_root_state(root_active)
-        if self.config.temp_cleanup.enabled:
+        trusted_active, trusted_reason, trusted_count = (
+            self._trusted_private_config_state()
+        )
+        if trusted_active:
+            self.ctx.logger.critical(
+                "可信 QQ 私聊完全绕过已启用：whitelist_count=%s "
+                "sandbox=disabled regex_guard=disabled sensitive_file_guard=disabled "
+                "for_same_private_stream=true",
+                trusted_count,
+            )
+        elif self.config.trusted_private_bypass.enabled:
+            self.ctx.logger.critical(
+                "可信 QQ 私聊完全绕过未生效：reason=%s",
+                trusted_reason,
+            )
+        if (
+            self.config.temp_cleanup.enabled
+            or self.config.file_upload.use_napcat_local_path
+        ):
             try:
                 await self._refresh_cleanup_service(run_now=True)
             except Exception as exc:
                 self._managed_temp_root = None
+                self._local_staging_root = None
                 self.ctx.logger.error(
-                    "受管临时文件服务初始化失败：error_type=%s",
+                    "插件临时文件服务初始化失败：error_type=%s",
                     type(exc).__name__,
+                )
+        if self.config.file_upload.use_napcat_local_path:
+            if self._local_staging_root is not None:
+                self.ctx.logger.warning(
+                    "NapCat 本地路径文件发送已启用：staging_root=%s "
+                    "napcat_visible_root=%s max_upload_mb=%s",
+                    self._local_staging_root,
+                    self.config.file_upload.napcat_staging_directory,
+                    self.config.file_upload.local_path_max_upload_mb,
+                )
+            else:
+                self.ctx.logger.error(
+                    "NapCat 本地路径文件发送配置无效；调用时将拒绝发送，"
+                    "不会静默退回 Base64"
                 )
         if unrestricted_active:
             self._sandbox_error = ""
@@ -938,6 +1407,8 @@ class ServerCommandPlugin(MaiBotPlugin):
         self._active_temp_tasks.clear()
         self._known_temp_tasks.clear()
         self._stream_temp_tasks.clear()
+        self._active_staging_uploads.clear()
+        self._retired_staging_roots.clear()
         self.ctx.logger.info("命令沙箱插件已卸载")
 
     async def on_config_update(self, scope: str, config_data: dict[str, object], version: str) -> None:
@@ -952,6 +1423,23 @@ class ServerCommandPlugin(MaiBotPlugin):
                 )
             root_active, root_reason = self._root_mode_state()
             unrestricted_active, unrestricted_reason = self._unrestricted_root_state(root_active)
+            trusted_active, trusted_reason, trusted_count = (
+                self._trusted_private_config_state()
+            )
+            if trusted_active:
+                self.ctx.logger.critical(
+                    "配置更新后可信 QQ 私聊完全绕过已启用：version=%s "
+                    "whitelist_count=%s sandbox=disabled regex_guard=disabled "
+                    "sensitive_file_guard=disabled for_same_private_stream=true",
+                    version,
+                    trusted_count,
+                )
+            elif self.config.trusted_private_bypass.enabled:
+                self.ctx.logger.critical(
+                    "配置更新后可信 QQ 私聊完全绕过未生效：version=%s reason=%s",
+                    version,
+                    trusted_reason,
+                )
             if unrestricted_active:
                 self.ctx.logger.critical(
                     "配置更新后完全 ROOT 已启用：version=%s cwd=/root "
@@ -988,6 +1476,28 @@ class ServerCommandPlugin(MaiBotPlugin):
     def _stream_account_id(stream: dict[str, object]) -> str:
         return str(stream.get("account_id") or "")
 
+    def _trusted_qq_user_ids(self) -> tuple[frozenset[str], str]:
+        settings = self.config.trusted_private_bypass
+        if not settings.enabled:
+            return frozenset(), "可信私聊完全绕过总开关未开启"
+        raw = str(settings.qq_user_ids or "").strip()
+        if not raw:
+            return frozenset(), "可信 QQ 号白名单为空"
+        tokens = [token for token in re.split(r"[\s,，;；]+", raw) if token]
+        if len(tokens) > _MAX_TRUSTED_QQ_USERS:
+            return frozenset(), f"可信 QQ 号超过 {_MAX_TRUSTED_QQ_USERS} 个"
+        if any(_QQ_USER_ID_RE.fullmatch(token) is None for token in tokens):
+            return frozenset(), "可信 QQ 号白名单包含无效格式"
+        return frozenset(tokens), ""
+
+    def _trusted_private_config_state(self) -> tuple[bool, str, int]:
+        whitelist, reason = self._trusted_qq_user_ids()
+        if not whitelist:
+            return False, reason, 0
+        if os.geteuid() != 0:
+            return False, "MaiBot 不是由 root 用户运行", len(whitelist)
+        return True, "可信私聊完全绕过已配置", len(whitelist)
+
     @staticmethod
     def _normalize_stream_list(value: Any) -> list[dict[str, object]]:
         if isinstance(value, dict):
@@ -995,6 +1505,147 @@ class ServerCommandPlugin(MaiBotPlugin):
         if not isinstance(value, list):
             return []
         return [item for item in value if isinstance(item, dict)]
+
+    async def _trusted_private_caller(
+        self,
+        current_stream_id: str,
+    ) -> tuple[bool, str]:
+        whitelist, config_reason = self._trusted_qq_user_ids()
+        if not whitelist:
+            return False, config_reason
+
+        normalized_stream_id = str(current_stream_id).strip()
+        if not normalized_stream_id:
+            return False, "工具调用缺少 Host 注入的 stream_id"
+
+        raw_streams = await self.ctx.chat.get_private_streams("qq")
+        matches: dict[tuple[str, str, str], dict[str, object]] = {}
+        for stream in self._normalize_stream_list(raw_streams):
+            platform = str(stream.get("platform") or "qq").strip().lower()
+            if platform != "qq":
+                continue
+            if self._stream_identifier(stream) != normalized_stream_id:
+                continue
+            if str(stream.get("group_id") or "").strip():
+                continue
+            chat_type = str(
+                stream.get("chat_type")
+                or stream.get("stream_type")
+                or ""
+            ).strip().lower()
+            if chat_type and chat_type not in {"private", "friend", "direct"}:
+                continue
+            user_id = str(stream.get("user_id") or "").strip()
+            account_id = self._stream_account_id(stream).strip()
+            if _QQ_USER_ID_RE.fullmatch(user_id) is None:
+                continue
+            key = (normalized_stream_id, user_id, account_id)
+            matches[key] = stream
+
+        if len(matches) != 1:
+            return False, "当前 stream_id 无法唯一反查为一个 QQ 私聊身份"
+        user_id = next(iter(matches))[1]
+        if user_id not in whitelist:
+            return False, "当前 QQ 私聊不在管理员白名单"
+        return True, ""
+
+    @staticmethod
+    def _action_string(kwargs: dict[str, Any], name: str) -> str:
+        """Read a legacy Action argument without trusting nested action_data."""
+
+        value = kwargs.get(name, "")
+        return str(value or "").strip()
+
+    @staticmethod
+    def _action_bool(kwargs: dict[str, Any], name: str) -> bool:
+        value = kwargs.get(name, False)
+        if isinstance(value, bool):
+            return value
+        normalized = str(value or "").strip().lower()
+        if normalized in {"", "0", "false", "no", "off"}:
+            return False
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        raise ValueError(f"{name} 必须是 true 或 false。")
+
+    @staticmethod
+    def _action_timeout(kwargs: dict[str, Any]) -> int:
+        raw_value = kwargs.get("timeout_seconds", 20)
+        if raw_value in (None, ""):
+            return 20
+        try:
+            return int(raw_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("timeout_seconds 必须是整数。") from exc
+
+    async def _authorize_trusted_action(
+        self,
+        stream_id: str,
+        *,
+        operation: str,
+        audit_id: str,
+    ) -> tuple[bool, dict[str, object] | None]:
+        """Authorize only the Host-overwritten stream of a legacy Action."""
+
+        normalized_stream_id = str(stream_id or "").strip()
+        if not normalized_stream_id:
+            self.ctx.logger.critical(
+                "可信私聊%s被拒绝：audit_id=%s reason=missing_host_stream",
+                operation,
+                audit_id,
+            )
+            return False, {
+                "success": False,
+                "content": "Host 未提供可信的真实会话 ID，已拒绝完全绕过。",
+                "execution_mode": "trusted_private_denied",
+                "trusted_private_bypass": False,
+            }
+        try:
+            authorized, reason = await self._trusted_private_caller(
+                normalized_stream_id
+            )
+        except Exception as exc:
+            self.ctx.logger.error(
+                "可信私聊%s身份反查异常：audit_id=%s error_type=%s",
+                operation,
+                audit_id,
+                type(exc).__name__,
+            )
+            return False, {
+                "success": False,
+                "content": "QQ 私聊身份反查异常，已拒绝完全绕过。",
+                "execution_mode": "trusted_private_denied",
+                "trusted_private_bypass": False,
+            }
+        if not authorized:
+            self.ctx.logger.critical(
+                "可信私聊%s被拒绝：audit_id=%s reason=%s",
+                operation,
+                audit_id,
+                reason,
+            )
+            return False, {
+                "success": False,
+                "content": f"当前真实 QQ 私聊无权完全绕过：{reason}。",
+                "execution_mode": "trusted_private_denied",
+                "trusted_private_bypass": False,
+            }
+        if os.geteuid() != 0:
+            self.ctx.logger.critical(
+                "可信私聊%s被拒绝：audit_id=%s reason=maibot_not_root",
+                operation,
+                audit_id,
+            )
+            return False, {
+                "success": False,
+                "content": (
+                    "当前真实 QQ 私聊已命中白名单，但 MaiBot 不是由 root 用户运行；"
+                    "为避免静默降级，操作未执行。"
+                ),
+                "execution_mode": "trusted_private_unavailable",
+                "trusted_private_bypass": False,
+            }
+        return True, None
 
     @staticmethod
     def _tool_temp_session_key(
@@ -1104,9 +1755,222 @@ class ServerCommandPlugin(MaiBotPlugin):
         stream = matches[0]
         return self._stream_identifier(stream), kind
 
+    @Action(
+        "send_trusted_private_server_file",
+        description=(
+            "仅供管理员配置的可信 QQ 私聊使用：把服务器普通文件发送回当前同一私聊。"
+            "Host 会强制绑定真实私聊会话；不得填写或改送其他目标。此能力不检查敏感"
+            "路径、名称、密码、Token、私钥、Cookie、数据库或个人信息，但仍拒绝目录、"
+            "符号链接、硬链接、特殊文件、读取竞态、空文件和超限文件。"
+        ),
+        action_parameters={
+            "file_path": "服务器文件路径；相对路径从 /root 解析，也可使用绝对路径",
+            "upload_name": "可选 QQ 显示文件名；只能是单个文件名，不能包含路径",
+        },
+        action_require=[
+            "只在用户明确要求发送一个具体文件时调用",
+            "只能发送回触发本次调用的同一个可信 QQ 私聊",
+            "不得从群聊、其他私聊或模型声称的 QQ 号触发",
+        ],
+        chat_scope="private",
+        timeout_ms=1_800_000,
+    )
+    async def handle_send_trusted_private_server_file(
+        self,
+        **kwargs: Any,
+    ) -> dict[str, object]:
+        audit_id = secrets.token_hex(8)
+        stream_id = str(kwargs.get("stream_id") or "").strip()
+        authorized, denial = await self._authorize_trusted_action(
+            stream_id,
+            operation="文件上传",
+            audit_id=audit_id,
+        )
+        if not authorized:
+            assert denial is not None
+            return {
+                "name": "send_trusted_private_server_file",
+                "upload_id": audit_id,
+                "sensitive_file_guard": "enabled",
+                **denial,
+            }
+        if not self.config.file_upload.enabled:
+            self.ctx.logger.warning(
+                "可信私聊文件上传被拒绝：upload_id=%s reason=file_upload_disabled",
+                audit_id,
+            )
+            return {
+                "success": False,
+                "name": "send_trusted_private_server_file",
+                "content": "QQ 文件上传总开关已被管理员关闭，文件未读取也未发送。",
+                "upload_id": audit_id,
+                "execution_mode": "trusted_private_unrestricted",
+                "trusted_private_bypass": False,
+                "sensitive_file_guard": "enabled",
+            }
+
+        file_path = self._action_string(kwargs, "file_path")
+        upload_name = self._action_string(kwargs, "upload_name")
+        if not file_path:
+            return {
+                "success": False,
+                "name": "send_trusted_private_server_file",
+                "content": "必须提供 file_path，文件未读取也未发送。",
+                "upload_id": audit_id,
+                "execution_mode": "trusted_private_unrestricted",
+                "trusted_private_bypass": True,
+                "sensitive_file_guard": "disabled_by_trusted_private",
+            }
+
+        if self.config.temp_cleanup.enabled and self._managed_temp_root is None:
+            try:
+                await asyncio.to_thread(
+                    self._initialize_sandbox,
+                    low_privilege=False,
+                )
+            except Exception as exc:
+                self.ctx.logger.error(
+                    "可信私聊上传前无法初始化受管临时目录："
+                    "upload_id=%s error_type=%s",
+                    audit_id,
+                    type(exc).__name__,
+                )
+
+        try:
+            prepared = await self._prepare_qq_upload(
+                file_path,
+                root_mode=True,
+                upload_name=upload_name or None,
+                sensitive_guard_enabled=False,
+            )
+        except FileUploadError as exc:
+            self.ctx.logger.warning(
+                "可信私聊文件上传被拒绝："
+                "upload_id=%s reason=physical_validation_failed",
+                audit_id,
+            )
+            return {
+                "success": False,
+                "name": "send_trusted_private_server_file",
+                "content": f"文件物理安全检查未通过，文件未发送：{exc}",
+                "upload_id": audit_id,
+                "execution_mode": "trusted_private_unrestricted",
+                "trusted_private_bypass": True,
+                "sensitive_file_guard": "disabled_by_trusted_private",
+            }
+        except Exception as exc:
+            self.ctx.logger.error(
+                "可信私聊文件检查异常：upload_id=%s error_type=%s",
+                audit_id,
+                type(exc).__name__,
+            )
+            return {
+                "success": False,
+                "name": "send_trusted_private_server_file",
+                "content": "文件检查发生内部异常，文件未发送。",
+                "upload_id": audit_id,
+                "execution_mode": "trusted_private_unrestricted",
+                "trusted_private_bypass": True,
+                "sensitive_file_guard": "disabled_by_trusted_private",
+            }
+
+        self.ctx.logger.critical(
+            "准备由可信 QQ 私聊完全绕过发送服务器文件："
+            "upload_id=%s bytes=%s scope=%s target=current_private "
+            "sensitive_guard=disabled transport=%s",
+            audit_id,
+            prepared.size,
+            prepared.source_scope,
+            prepared.transport,
+        )
+        sent, staging_status, send_error_type = await self._send_prepared_file(
+            prepared,
+            stream_id,
+        )
+        if not sent:
+            self.ctx.logger.error(
+                "可信私聊文件发送失败或结果不确定："
+                "upload_id=%s error_type=%s",
+                audit_id,
+                send_error_type,
+            )
+            return {
+                "success": False,
+                "name": "send_trusted_private_server_file",
+                "content": (
+                    "QQ 文件发送失败或结果不确定。请先人工检查当前私聊，"
+                    "不要自动重试，以免重复发送。"
+                ),
+                "upload_id": audit_id,
+                "execution_mode": "trusted_private_unrestricted",
+                "source_scope": prepared.source_scope,
+                "trusted_private_bypass": True,
+                "sensitive_file_guard": "disabled_by_trusted_private",
+                "retry_safe": False,
+                "temporary_file_cleanup": "retained_send_unconfirmed",
+                "upload_transport": prepared.transport,
+                "staging_cleanup": staging_status,
+            }
+
+        try:
+            cleanup_status = await self._delete_uploaded_temp_file(prepared)
+        except Exception as exc:
+            cleanup_status = "cleanup_failed"
+            self.ctx.logger.error(
+                "可信私聊文件已发送，但临时源文件清理异常："
+                "upload_id=%s error_type=%s",
+                audit_id,
+                type(exc).__name__,
+            )
+        self.ctx.logger.critical(
+            "可信私聊文件发送完成：upload_id=%s bytes=%s scope=%s "
+            "temporary_cleanup=%s transport=%s staging_cleanup=%s",
+            audit_id,
+            prepared.size,
+            prepared.source_scope,
+            cleanup_status,
+            prepared.transport,
+            staging_status,
+        )
+        if cleanup_status in {"deleted", "deleted_file_prune_failed"}:
+            cleanup_notice = "文件来自受管临时目录，发送成功后源文件已安全删除。"
+        elif (
+            prepared.cleanup_relative_parts is not None
+            and not self.config.temp_cleanup.delete_after_upload
+        ):
+            cleanup_notice = "文件来自受管临时目录，但管理员已关闭发送成功后的立即删除。"
+        elif prepared.cleanup_relative_parts is not None:
+            cleanup_notice = (
+                "文件来自受管临时目录，但因任务仍活动、文件变化或清理不可用而保留；"
+                "之后仍会按保留期限检查。"
+            )
+        else:
+            cleanup_notice = "源文件不属于受管临时目录，插件没有删除它。"
+        return {
+            "success": True,
+            "name": "send_trusted_private_server_file",
+            "content": (
+                f"文件已发送回当前可信 QQ 私聊：{prepared.name}"
+                f"（{prepared.size} 字节）。{cleanup_notice}"
+                "本次敏感路径、文件名和内容扫描已按管理员配置关闭。"
+            ),
+            "upload_id": audit_id,
+            "execution_mode": "trusted_private_unrestricted",
+            "source_scope": prepared.source_scope,
+            "trusted_private_bypass": True,
+            "sensitive_file_guard": "disabled_by_trusted_private",
+            "file_name": prepared.name,
+            "file_size": prepared.size,
+            "sha256": prepared.sha256,
+            "target_type": "current_private",
+            "temporary_file_cleanup": cleanup_status,
+            "upload_transport": prepared.transport,
+            "staging_cleanup": staging_status,
+        }
+
     @Tool(
         "send_server_file_to_qq",
-        brief_description="把服务器上的非敏感普通文件发送到指定 QQ 会话",
+        brief_description="把服务器上的普通文件发送到指定 QQ 会话",
         detailed_description=(
             "仅当用户明确要求发送某个具体文件时调用，不得主动、批量或猜测性上传。"
             "target_type 可为 current（当前 QQ 会话）、stream（MaiBot 聊天流 ID）、"
@@ -1114,7 +1978,7 @@ class ServerCommandPlugin(MaiBotPlugin):
             "MaiBot 建立聊天流。多 QQ 机器人账号匹配时必须提供 account_id，绝不能"
             "自行选择。默认低权限模式只能读取 /work（宿主机 maibot-command-file）"
             "中的普通文件；受限 ROOT 或完全 ROOT 生效后可读取全系统普通文件。"
-            "无论哪种模式，都绝对禁止上传密码、Token、私钥、Cookie、认证配置、"
+            "此普通文件工具始终禁止上传密码、Token、私钥、Cookie、认证配置、"
             "数据库、备份、个人信息或其他敏感数据，也不得通过改名、复制、压缩、"
             "编码等方式绕过；不确定文件是否敏感时必须拒绝调用。内置路径和内容扫描"
             "只是额外防线，扫描未命中不代表文件安全。符号链接、硬链接、目录、FIFO、"
@@ -1160,11 +2024,15 @@ class ServerCommandPlugin(MaiBotPlugin):
             ToolParameterInfo(
                 name="upload_name",
                 param_type=ToolParamType.STRING,
-                description="可选的 QQ 显示文件名；只能是单个非敏感文件名，不能包含路径",
+                description=(
+                    "可选的 QQ 显示文件名；只能是单个文件名且不能包含路径；"
+                    "会拒绝敏感名称"
+                ),
                 required=False,
                 default="",
             ),
         ],
+        timeout_ms=1_800_000,
     )
     async def handle_send_server_file_to_qq(
         self,
@@ -1176,6 +2044,8 @@ class ServerCommandPlugin(MaiBotPlugin):
         **kwargs: Any,
     ) -> dict[str, object]:
         audit_id = secrets.token_hex(8)
+        current_stream_id = str(kwargs.get("stream_id") or "").strip()
+        trusted_file_bypass = False
         if not self.config.file_upload.enabled:
             self.ctx.logger.warning(
                 "QQ 文件上传被拒绝：upload_id=%s reason=tool_disabled",
@@ -1193,7 +2063,7 @@ class ServerCommandPlugin(MaiBotPlugin):
                 target_type,
                 target_id,
                 account_id,
-                str(kwargs.get("stream_id") or ""),
+                current_stream_id,
             )
         except FileUploadError as exc:
             self.ctx.logger.warning(
@@ -1219,11 +2089,16 @@ class ServerCommandPlugin(MaiBotPlugin):
                 "upload_id": audit_id,
             }
 
-        root_active, root_reason = self._root_mode_state()
-        unrestricted_active, unrestricted_reason = self._unrestricted_root_state(root_active)
+        configured_root_active, root_reason = self._root_mode_state()
+        unrestricted_active, unrestricted_reason = self._unrestricted_root_state(
+            configured_root_active
+        )
+        root_active = configured_root_active
+        sensitive_guard_enabled = True
+        sensitive_guard_state = "enabled"
         if unrestricted_active:
             execution_mode = "root_unrestricted"
-        elif root_active:
+        elif configured_root_active:
             execution_mode = "root_restricted"
         else:
             execution_mode = "sandbox"
@@ -1274,14 +2149,11 @@ class ServerCommandPlugin(MaiBotPlugin):
                 )
 
         try:
-            prepared = await asyncio.to_thread(
-                prepare_file_upload,
+            prepared = await self._prepare_qq_upload(
                 str(file_path),
-                sandbox_root=self._sandbox_path,
                 root_mode=root_active,
-                configured_max_mb=self.config.file_upload.max_upload_mb,
                 upload_name=str(upload_name) if upload_name else None,
-                managed_temp_root=self._managed_temp_root,
+                sensitive_guard_enabled=sensitive_guard_enabled,
             )
         except FileUploadError as exc:
             self.ctx.logger.warning(
@@ -1295,7 +2167,7 @@ class ServerCommandPlugin(MaiBotPlugin):
                 "content": f"文件安全检查未通过，文件未发送：{exc}",
                 "upload_id": audit_id,
                 "execution_mode": execution_mode,
-                "sensitive_file_guard": "enabled",
+                "sensitive_file_guard": sensitive_guard_state,
             }
         except Exception as exc:
             self.ctx.logger.error(
@@ -1310,38 +2182,30 @@ class ServerCommandPlugin(MaiBotPlugin):
                 "content": "文件安全检查发生内部异常，文件未发送。",
                 "upload_id": audit_id,
                 "execution_mode": execution_mode,
-                "sensitive_file_guard": "enabled",
+                "sensitive_file_guard": sensitive_guard_state,
             }
 
-        try:
-            self.ctx.logger.warning(
-                "准备向 QQ 发送服务器文件：upload_id=%s mode=%s scope=%s "
-                "bytes=%s target_type=%s",
-                audit_id,
-                execution_mode,
-                prepared.source_scope,
-                prepared.size,
-                resolved_kind,
-            )
-            send_result = await self.ctx.send.custom(
-                "file",
-                prepared.message_payload(),
-                stream_id,
-                storage_message=False,
-                show_log=False,
-                sync_to_maisaka_history=False,
-            )
-            confirmed_success = send_result is True or (
-                isinstance(send_result, dict) and send_result.get("success") is True
-            )
-            if not confirmed_success:
-                raise RuntimeError("QQ 适配器未明确确认发送成功")
-        except Exception as exc:
+        self.ctx.logger.warning(
+            "准备向 QQ 发送服务器文件：upload_id=%s mode=%s scope=%s "
+            "bytes=%s target_type=%s sensitive_guard=%s transport=%s",
+            audit_id,
+            execution_mode,
+            prepared.source_scope,
+            prepared.size,
+            resolved_kind,
+            sensitive_guard_state,
+            prepared.transport,
+        )
+        sent, staging_status, send_error_type = await self._send_prepared_file(
+            prepared,
+            stream_id,
+        )
+        if not sent:
             self.ctx.logger.error(
                 "QQ 文件发送失败或结果不确定：upload_id=%s mode=%s error_type=%s",
                 audit_id,
                 execution_mode,
-                type(exc).__name__,
+                send_error_type,
             )
             return {
                 "success": False,
@@ -1353,9 +2217,12 @@ class ServerCommandPlugin(MaiBotPlugin):
                 "upload_id": audit_id,
                 "execution_mode": execution_mode,
                 "source_scope": prepared.source_scope,
-                "sensitive_file_guard": "enabled",
+                "sensitive_file_guard": sensitive_guard_state,
+                "trusted_private_bypass": trusted_file_bypass,
                 "retry_safe": False,
                 "temporary_file_cleanup": "retained_send_unconfirmed",
+                "upload_transport": prepared.transport,
+                "staging_cleanup": staging_status,
             }
 
         try:
@@ -1371,12 +2238,14 @@ class ServerCommandPlugin(MaiBotPlugin):
             )
         self.ctx.logger.warning(
             "QQ 文件发送完成：upload_id=%s mode=%s scope=%s bytes=%s "
-            "temporary_cleanup=%s",
+            "temporary_cleanup=%s transport=%s staging_cleanup=%s",
             audit_id,
             execution_mode,
             prepared.source_scope,
             prepared.size,
             cleanup_status,
+            prepared.transport,
+            staging_status,
         )
         if cleanup_status in {"deleted", "deleted_file_prune_failed"}:
             cleanup_notice = "该文件来自受管临时目录，发送成功后源文件已安全删除。"
@@ -1392,28 +2261,220 @@ class ServerCommandPlugin(MaiBotPlugin):
             )
         else:
             cleanup_notice = "源文件不属于受管临时目录，插件没有删除它。"
+        guard_notice = "敏感文件禁令仍然有效；内置扫描通过不代表可忽略人工判断。"
         return {
             "success": True,
             "name": "send_server_file_to_qq",
             "content": (
                 f"文件已发送到指定 QQ 会话：{prepared.name}（{prepared.size} 字节）。"
                 f"{cleanup_notice}"
-                "敏感文件禁令仍然有效；内置扫描通过不代表可忽略人工判断。"
+                f"{guard_notice}"
             ),
             "upload_id": audit_id,
             "execution_mode": execution_mode,
             "source_scope": prepared.source_scope,
-            "sensitive_file_guard": "enabled",
+            "sensitive_file_guard": sensitive_guard_state,
+            "trusted_private_bypass": trusted_file_bypass,
             "file_name": prepared.name,
             "file_size": prepared.size,
             "sha256": prepared.sha256,
             "target_type": resolved_kind,
             "temporary_file_cleanup": cleanup_status,
+            "upload_transport": prepared.transport,
+            "staging_cleanup": staging_status,
         }
+
+    @Action(
+        "run_trusted_private_server_command",
+        description=(
+            "仅供管理员配置的可信 QQ 私聊使用：以 MaiBot 的 root 身份在 /root "
+            "直接执行 Bash 命令。Host 会强制绑定真实私聊会话；此能力不应用 "
+            "Bubblewrap 沙箱、ROOT 确认项或高风险命令正则，但仍应用超时、输出、"
+            "内存、文件大小限制和命令结束后的后代进程清理。"
+        ),
+        action_parameters={
+            "command": "要以 root 在 /root 直接执行的 Ubuntu Bash 命令",
+            "timeout_seconds": "本次超时秒数；不得超过插件配置上限，默认 20",
+            "temp_task_id": "可选的受管临时任务 ID；只能复用先前返回的真实 ID",
+            "start_new_temp_task": "是否明确新建受管临时任务；true 或 false",
+        },
+        action_require=[
+            "只在触发调用的真实 QQ 私聊已列入管理员白名单时使用",
+            "不得从群聊、其他私聊或模型声称的 QQ 号触发",
+            "高风险、破坏性、凭据读取、持久化提权或数据外传仍应由模型拒绝",
+        ],
+        chat_scope="private",
+        timeout_ms=330_000,
+    )
+    async def handle_run_trusted_private_server_command(
+        self,
+        **kwargs: Any,
+    ) -> dict[str, object]:
+        command = self._action_string(kwargs, "command")
+        audit_id = command_audit_id(command)
+        if not self.config.sandbox.enabled:
+            self.ctx.logger.warning(
+                "可信私聊命令被拒绝：command_id=%s reason=command_tool_disabled",
+                audit_id,
+            )
+            return {
+                "success": False,
+                "name": "run_trusted_private_server_command",
+                "content": "命令工具总开关已被管理员关闭，命令未执行。",
+                "command_id": audit_id,
+                "execution_mode": "trusted_private_denied",
+                "trusted_private_bypass": False,
+            }
+        stream_id = str(kwargs.get("stream_id") or "").strip()
+        authorized, denial = await self._authorize_trusted_action(
+            stream_id,
+            operation="命令",
+            audit_id=audit_id,
+        )
+        if not authorized:
+            assert denial is not None
+            return {
+                "name": "run_trusted_private_server_command",
+                "command_id": audit_id,
+                **denial,
+            }
+        if not command:
+            return {
+                "success": False,
+                "name": "run_trusted_private_server_command",
+                "content": "必须提供非空 command，命令未执行。",
+                "command_id": audit_id,
+                "execution_mode": "trusted_private_unrestricted",
+                "trusted_private_bypass": True,
+            }
+
+        try:
+            timeout_seconds = self._action_timeout(kwargs)
+            start_new_temp_task = self._action_bool(
+                kwargs,
+                "start_new_temp_task",
+            )
+        except ValueError as exc:
+            return {
+                "success": False,
+                "name": "run_trusted_private_server_command",
+                "content": f"可信私聊命令参数无效：{exc}",
+                "command_id": audit_id,
+                "execution_mode": "trusted_private_unrestricted",
+                "trusted_private_bypass": True,
+            }
+        temp_task_id = self._action_string(kwargs, "temp_task_id")
+        temp_session_key = self._tool_temp_session_key(
+            stream_id,
+            kwargs.get("message"),
+        )
+        settings = self.config.sandbox
+        limits = SandboxLimits(
+            timeout_seconds=settings.timeout_seconds,
+            max_output_bytes=settings.max_output_bytes,
+            memory_limit_mb=settings.memory_limit_mb,
+            file_size_limit_mb=settings.file_size_limit_mb,
+            max_processes=settings.max_processes,
+        )
+        try:
+            temp_task = await self._create_command_temp(
+                root_active=True,
+                session_key=temp_session_key,
+                requested_task_id=temp_task_id,
+                start_new_task=start_new_temp_task,
+            )
+        except Exception as exc:
+            self.ctx.logger.error(
+                "可信私聊命令未执行：受管临时目录不可用："
+                "command_id=%s error_type=%s",
+                audit_id,
+                type(exc).__name__,
+            )
+            return {
+                "success": False,
+                "name": "run_trusted_private_server_command",
+                "content": (
+                    f"{TRUSTED_PRIVATE_NOTICE}\n\n"
+                    "受管临时目录初始化或复用失败，命令未执行。"
+                ),
+                "command_id": audit_id,
+                "execution_mode": "trusted_private_unrestricted",
+                "trusted_private_bypass": True,
+                "managed_temp_cleanup": "unavailable",
+            }
+
+        try:
+            self.ctx.logger.critical(
+                "麦麦准备执行可信私聊完全绕过命令："
+                "command_id=%s cwd=/root regex_guard=disabled timeout=%ss",
+                audit_id,
+                min(
+                    max(1, timeout_seconds),
+                    limits.normalized().timeout_seconds,
+                ),
+            )
+            result = await run_unrestricted_root_command(
+                command,
+                limits,
+                requested_timeout=timeout_seconds,
+                managed_temp_directory=(
+                    os.fspath(temp_task.host_path)
+                    if temp_task is not None
+                    else None
+                ),
+            )
+            if result.timed_out:
+                self.ctx.logger.warning(
+                    "可信私聊完全绕过命令超时："
+                    "command_id=%s exit_code=%s",
+                    audit_id,
+                    result.exit_code,
+                )
+            elif result.exit_code != 0:
+                self.ctx.logger.warning(
+                    "可信私聊完全绕过命令失败："
+                    "command_id=%s exit_code=%s",
+                    audit_id,
+                    result.exit_code,
+                )
+            else:
+                self.ctx.logger.warning(
+                    "可信私聊完全绕过命令成功：command_id=%s exit_code=0",
+                    audit_id,
+                )
+            payload = self._trusted_private_result(result)
+            payload["command_id"] = audit_id
+            payload["name"] = "run_trusted_private_server_command"
+        except Exception as exc:
+            self.ctx.logger.exception(
+                "可信私聊完全绕过命令未执行或插件异常："
+                "command_id=%s error_type=%s",
+                audit_id,
+                type(exc).__name__,
+            )
+            payload = {
+                "success": False,
+                "name": "run_trusted_private_server_command",
+                "content": f"{TRUSTED_PRIVATE_NOTICE}\n\n命令未执行：{exc}",
+                "command_id": audit_id,
+                "execution_mode": "trusted_private_unrestricted",
+                "command_regex_guard": "disabled_by_trusted_private",
+                "working_directory": "/root",
+                "process_limit": "not_enforced_for_uid_0",
+                "descendant_cleanup": "on_command_exit_or_timeout",
+                "trusted_private_bypass": True,
+            }
+        finally:
+            await self._release_command_temp(temp_task)
+        return self._decorate_temp_policy(
+            payload,
+            temp_task,
+            root_active=True,
+        )
 
     @Tool(
         "run_server_command",
-        brief_description="在服务器的专用 Ubuntu 沙箱目录中运行命令",
+        brief_description="按管理员配置在 Ubuntu 沙箱或 ROOT 模式运行命令",
         detailed_description=(
             "默认仅在 MaiBot 主程序目录下的 maibot-command-file 沙箱中执行 Bash 命令。"
             "管理员完成受限 ROOT 的全部确认后，沙箱会关闭，命令将以 root 在 /root "
@@ -1467,6 +2528,7 @@ class ServerCommandPlugin(MaiBotPlugin):
                 default=False,
             ),
         ],
+        timeout_ms=330_000,
     )
     async def handle_run_server_command(
         self,
@@ -1501,6 +2563,9 @@ class ServerCommandPlugin(MaiBotPlugin):
             max_processes=settings.max_processes,
         )
         if unrestricted_active:
+            execution_mode = "root_unrestricted"
+            mode_label = "完全 ROOT"
+            mode_notice = UNRESTRICTED_ROOT_NOTICE
             try:
                 temp_task = await self._create_command_temp(
                     root_active=True,
@@ -1510,8 +2575,9 @@ class ServerCommandPlugin(MaiBotPlugin):
                 )
             except Exception as exc:
                 self.ctx.logger.error(
-                    "完全 ROOT 命令未执行：受管临时目录不可用："
+                    "%s 命令未执行：受管临时目录不可用："
                     "command_id=%s error_type=%s",
+                    mode_label,
                     audit_id,
                     type(exc).__name__,
                 )
@@ -1519,16 +2585,17 @@ class ServerCommandPlugin(MaiBotPlugin):
                     "success": False,
                     "name": "run_server_command",
                     "content": (
-                        f"{UNRESTRICTED_ROOT_NOTICE}\n\n"
+                        f"{mode_notice}\n\n"
                         "受管临时目录初始化失败，命令未执行。"
                     ),
-                    "execution_mode": "root_unrestricted",
+                    "execution_mode": execution_mode,
                     "managed_temp_cleanup": "unavailable",
                 }
             try:
                 self.ctx.logger.critical(
-                    "麦麦准备执行完全 ROOT 命令：command_id=%s cwd=/root "
+                    "麦麦准备执行%s命令：command_id=%s cwd=/root "
                     "regex_guard=disabled timeout=%ss",
+                    mode_label,
                     audit_id,
                     min(max(1, int(timeout_seconds)), limits.normalized().timeout_seconds),
                 )
@@ -1542,33 +2609,37 @@ class ServerCommandPlugin(MaiBotPlugin):
                 )
                 if result.timed_out:
                     self.ctx.logger.warning(
-                        "完全 ROOT 命令执行超时：command_id=%s exit_code=%s",
+                        "%s 命令执行超时：command_id=%s exit_code=%s",
+                        mode_label,
                         audit_id,
                         result.exit_code,
                     )
                 elif result.exit_code != 0:
                     self.ctx.logger.warning(
-                        "完全 ROOT 命令执行失败：command_id=%s exit_code=%s",
+                        "%s 命令执行失败：command_id=%s exit_code=%s",
+                        mode_label,
                         audit_id,
                         result.exit_code,
                     )
                 else:
                     self.ctx.logger.warning(
-                        "完全 ROOT 命令执行成功：command_id=%s exit_code=0",
+                        "%s 命令执行成功：command_id=%s exit_code=0",
+                        mode_label,
                         audit_id,
                     )
                 payload = self._unrestricted_root_result(result)
             except Exception as exc:
                 self.ctx.logger.exception(
-                    "完全 ROOT 命令未执行或插件异常：command_id=%s error=%s",
+                    "%s 命令未执行或插件异常：command_id=%s error=%s",
+                    mode_label,
                     audit_id,
                     exc,
                 )
                 payload = {
                     "success": False,
                     "name": "run_server_command",
-                    "content": f"{UNRESTRICTED_ROOT_NOTICE}\n\n命令未执行：{exc}",
-                    "execution_mode": "root_unrestricted",
+                    "content": f"{mode_notice}\n\n命令未执行：{exc}",
+                    "execution_mode": execution_mode,
                     "command_regex_guard": "disabled",
                     "working_directory": "/root",
                     "process_limit": "not_enforced_for_uid_0",
