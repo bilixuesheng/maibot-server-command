@@ -693,10 +693,19 @@ class ServerCommandPlugin(MaiBotPlugin):
         components = super().get_components()
         for component in components:
             metadata = component.get("metadata")
-            if isinstance(metadata, dict) and "timeout_ms" in metadata:
-                component["timeout_ms"] = int(metadata["timeout_ms"])
+            if not isinstance(metadata, dict):
+                continue
+            decorator_metadata = metadata.get("metadata")
+            raw_timeout = metadata.get("timeout_ms")
+            if raw_timeout is None and isinstance(decorator_metadata, dict):
+                raw_timeout = decorator_metadata.get("timeout_ms")
+            if raw_timeout is not None:
+                timeout_ms = int(raw_timeout)
+                component["timeout_ms"] = timeout_ms
+                metadata["timeout_ms"] = timeout_ms
             if component.get("name") in _TRUSTED_ACTION_NAMES:
                 component["chat_scope"] = "private"
+                metadata["chat_scope"] = "private"
         return components
 
     def _root_mode_state(self) -> tuple[bool, str]:
@@ -2789,59 +2798,3 @@ class ServerCommandPlugin(MaiBotPlugin):
             }
 
         try:
-            self.ctx.logger.info(
-                "麦麦准备执行沙箱命令：command_id=%s network_enabled=%s timeout=%ss",
-                audit_id,
-                settings.network_enabled,
-                min(max(1, int(timeout_seconds)), limits.normalized().timeout_seconds),
-            )
-            result = await run_command(
-                str(command),
-                self._sandbox_path,
-                limits,
-                requested_timeout=timeout_seconds,
-                network_enabled=settings.network_enabled,
-                managed_temp_directory=(
-                    temp_task.sandbox_path if temp_task is not None else None
-                ),
-            )
-            if result.timed_out:
-                self.ctx.logger.warning(
-                    "沙箱命令执行超时：command_id=%s exit_code=%s",
-                    audit_id,
-                    result.exit_code,
-                )
-            elif result.exit_code != 0:
-                self.ctx.logger.warning(
-                    "沙箱命令执行失败：command_id=%s exit_code=%s",
-                    audit_id,
-                    result.exit_code,
-                )
-            else:
-                self.ctx.logger.info(
-                    "沙箱命令执行成功：command_id=%s exit_code=0",
-                    audit_id,
-                )
-            payload = result.as_dict()
-        except Exception as exc:
-            self.ctx.logger.exception(
-                "沙箱命令被拒绝或插件异常：command_id=%s error=%s",
-                audit_id,
-                exc,
-            )
-            payload = {
-                "success": False,
-                "name": "run_server_command",
-                "content": f"命令未执行：{exc}",
-            }
-        finally:
-            await self._release_command_temp(temp_task)
-        return self._decorate_temp_policy(
-            payload,
-            temp_task,
-            root_active=False,
-        )
-
-
-def create_plugin() -> ServerCommandPlugin:
-    return ServerCommandPlugin()
