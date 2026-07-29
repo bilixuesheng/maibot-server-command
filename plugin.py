@@ -1,7 +1,9 @@
 """MaiBot tool plugin for running commands in a fixed Ubuntu sandbox."""
 
+import asyncio
 import importlib.util
 import os
+import secrets
 import sys
 from pathlib import Path
 from typing import Any
@@ -13,7 +15,7 @@ from maibot_sdk.types import ToolParameterInfo, ToolParamType
 def _load_sibling_executor() -> Any:
     """Load executor.py without relying on the Runner's sys.path."""
 
-    module_name = "_xuesheng_maibot_server_command_executor_v1_0_12"
+    module_name = "_xuesheng_maibot_server_command_executor_v1_0_13"
     loaded = sys.modules.get(module_name)
     if loaded is not None:
         return loaded
@@ -33,7 +35,31 @@ def _load_sibling_executor() -> Any:
     return module
 
 
+def _load_sibling_file_upload() -> Any:
+    """Load file_upload.py without relying on the Runner's sys.path."""
+
+    module_name = "_xuesheng_maibot_server_command_file_upload_v1_0_13"
+    loaded = sys.modules.get(module_name)
+    if loaded is not None:
+        return loaded
+
+    upload_path = Path(__file__).resolve().with_name("file_upload.py")
+    spec = importlib.util.spec_from_file_location(module_name, upload_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"无法加载插件文件上传模块：{upload_path}")
+
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(module_name, None)
+        raise
+    return module
+
+
 _executor = _load_sibling_executor()
+_file_upload = _load_sibling_file_upload()
 SandboxLimits = _executor.SandboxLimits
 command_audit_id = _executor.command_audit_id
 find_maibot_root = _executor.find_maibot_root
@@ -43,6 +69,8 @@ resolve_execution_identity = _executor.resolve_execution_identity
 run_command = _executor.run_command
 run_root_command = _executor.run_root_command
 run_unrestricted_root_command = _executor.run_unrestricted_root_command
+FileUploadError = _file_upload.FileUploadError
+prepare_file_upload = _file_upload.prepare_file_upload
 
 
 ROOT_MODE_NOTICE = (
@@ -51,6 +79,8 @@ ROOT_MODE_NOTICE = (
     "凭据读取或泄露数据的命令；不确定是否安全时不要执行。\n"
     "插件的正则防护无法保证识别 Base64、变量展开、eval 等混淆命令，"
     "不能把“未被拦截”视为命令安全。\n"
+    "ROOT 文件上传可以读取全系统普通文件，但敏感文件始终禁止上传；"
+    "不得通过改名、压缩、编码或复制到其他目录绕过。\n"
     "ROOT 不受“最大进程数”配置约束；命令结束或超时后，插件会清理本次命令"
     "直接产生的后台后代进程。"
 )
@@ -60,6 +90,8 @@ UNRESTRICTED_ROOT_NOTICE = (
     "管理员已完成十重认证，插件不会运行高风险命令正则拦截。"
     "你拥有服务器最高权限，仍必须自行判断并坚决拒绝高风险、破坏性、"
     "提权维持、凭据读取或泄露数据的命令；不确定是否安全时不要执行。\n"
+    "完全 ROOT 只关闭命令正则拦截，不会关闭文件上传的敏感信息防护；"
+    "不得上传、改名、打包或编码任何敏感数据。\n"
     "ROOT 不受“最大进程数”配置约束；命令结束或超时后，插件会清理本次命令"
     "直接产生的后台后代进程。"
 )
@@ -148,12 +180,48 @@ class CommandSandboxConfig(PluginConfigBase):
     )
 
 
+class FileUploadConfig(PluginConfigBase):
+    """控制服务器文件发送到 QQ 的独立高风险能力。"""
+
+    __ui_label__ = "QQ 文件上传"
+    __ui_icon__ = "file-up"
+    __ui_order__ = 1
+
+    enabled: bool = Field(
+        default=False,
+        description="是否允许麦麦把服务器文件发送到指定 QQ 会话",
+        json_schema_extra={
+            "label": "启用 QQ 文件上传",
+            "hint": (
+                "默认关闭。低权限模式只能读取 maibot-command-file；"
+                "ROOT 模式可读取全系统普通文件。敏感文件始终禁止上传。"
+            ),
+            "x-widget": "switch",
+        },
+    )
+    max_upload_mb: int = Field(
+        default=8,
+        ge=1,
+        le=10,
+        description="单次 QQ 文件上传大小上限（1–10 MiB）",
+        json_schema_extra={
+            "label": "单文件上传上限（MiB）",
+            "hint": (
+                "默认 8 MiB，硬上限 10 MiB。文件会经过 Base64 封装，"
+                "该上限用于确保请求不超过 MaiBot 插件 IPC 帧限制。"
+            ),
+            "x-widget": "number",
+            "step": 1,
+        },
+    )
+
+
 class RootPrivilegeConfig(PluginConfigBase):
     """需要多重确认才能启用的受限 root 模式。"""
 
     __ui_label__ = "受限 ROOT（极高风险）"
     __ui_icon__ = "triangle-alert"
-    __ui_order__ = 1
+    __ui_order__ = 2
 
     enabled: bool = Field(
         default=False,
@@ -191,6 +259,19 @@ class RootPrivilegeConfig(PluginConfigBase):
             "x-widget": "switch",
         },
     )
+    confirmation_4: bool = Field(
+        default=False,
+        description="第四次确认允许 ROOT 访问全部文件并确认服务器没有敏感文件",
+        json_schema_extra={
+            "label": "第四次确认：服务器无敏感文件",
+            "hint": (
+                "ROOT 文件上传能读取全系统普通文件。请先确认服务器不存在密码、"
+                "Token、私钥、Cookie、数据库、个人信息等敏感文件；"
+                "插件仍会拒绝识别到的敏感文件。"
+            ),
+            "x-widget": "switch",
+        },
+    )
     final_confirmation: int = Field(
         default=0,
         ge=0,
@@ -198,7 +279,7 @@ class RootPrivilegeConfig(PluginConfigBase):
         description="最终数字确认；必须手动从 0 改为 1",
         json_schema_extra={
             "label": "最终确认：把 0 改成 1",
-            "hint": "只有数值等于 1，且上面三个确认开关全部开启时，受限 ROOT 才会生效。",
+            "hint": "只有数值等于 1，且上面四个确认开关全部开启时，受限 ROOT 才会生效。",
             "x-widget": "number",
             "step": 1,
         },
@@ -210,7 +291,7 @@ class UnrestrictedRootConfig(PluginConfigBase):
 
     __ui_label__ = "完全 ROOT（无命令正则拦截）"
     __ui_icon__ = "skull"
-    __ui_order__ = 2
+    __ui_order__ = 3
 
     enabled: bool = Field(
         default=False,
@@ -327,7 +408,7 @@ class PluginMetadataConfig(PluginConfigBase):
     __ui_order__ = -1
 
     config_version: str = Field(
-        default="1.0.12",
+        default="1.0.13",
         description="配置结构版本",
         json_schema_extra={
             "label": "配置版本",
@@ -342,12 +423,13 @@ class ServerCommandPluginConfig(PluginConfigBase):
 
     plugin: PluginMetadataConfig = Field(default_factory=PluginMetadataConfig)
     sandbox: CommandSandboxConfig = Field(default_factory=CommandSandboxConfig)
+    file_upload: FileUploadConfig = Field(default_factory=FileUploadConfig)
     root_mode: RootPrivilegeConfig = Field(default_factory=RootPrivilegeConfig)
     unrestricted_root: UnrestrictedRootConfig = Field(default_factory=UnrestrictedRootConfig)
 
 
 class ServerCommandPlugin(MaiBotPlugin):
-    """Expose one fail-closed command tool to Maisaka."""
+    """Expose fail-closed command and QQ file tools to Maisaka."""
 
     config_model = ServerCommandPluginConfig
 
@@ -370,11 +452,13 @@ class ServerCommandPlugin(MaiBotPlugin):
             missing.append("第二次确认未开启")
         if not settings.confirmation_3:
             missing.append("第三次确认未开启")
+        if not settings.confirmation_4:
+            missing.append("第四次确认未开启")
         if int(settings.final_confirmation) != 1:
             missing.append("最终确认值不是 1")
         if missing:
             return False, "；".join(missing)
-        return True, "已满足 root 用户、总开关、三次开关和数值 1 的全部条件"
+        return True, "已满足 root 用户、总开关、四次开关和数值 1 的全部条件"
 
     def _unrestricted_root_state(
         self,
@@ -518,6 +602,361 @@ class ServerCommandPlugin(MaiBotPlugin):
                     root_reason,
                     unrestricted_reason,
                 )
+
+    @staticmethod
+    def _stream_identifier(stream: dict[str, object]) -> str:
+        value = stream.get("stream_id") or stream.get("session_id")
+        return str(value or "")
+
+    @staticmethod
+    def _stream_account_id(stream: dict[str, object]) -> str:
+        return str(stream.get("account_id") or "")
+
+    @staticmethod
+    def _normalize_stream_list(value: Any) -> list[dict[str, object]]:
+        if isinstance(value, dict):
+            value = value.get("streams", [])
+        if not isinstance(value, list):
+            return []
+        return [item for item in value if isinstance(item, dict)]
+
+    async def _resolve_qq_stream(
+        self,
+        target_type: str,
+        target_id: str,
+        account_id: str,
+        current_stream_id: str,
+    ) -> tuple[str, str]:
+        kind = str(target_type).strip().lower()
+        requested_target = str(target_id).strip()
+        requested_account = str(account_id).strip()
+        if kind not in {"current", "stream", "group", "private"}:
+            raise FileUploadError(
+                "target_type 只能是 current、stream、group 或 private。"
+            )
+
+        if kind == "current":
+            requested_target = requested_target or str(current_stream_id).strip()
+            if not requested_target:
+                raise FileUploadError(
+                    "当前调用没有可用的 QQ stream_id；请改用 group、private 或 stream 并填写 target_id。"
+                )
+            kind = "stream"
+        elif not requested_target:
+            raise FileUploadError("指定 QQ 会话时必须填写 target_id。")
+
+        if kind == "group":
+            raw_streams = await self.ctx.chat.get_group_streams("qq")
+            match_key = "group_id"
+        elif kind == "private":
+            raw_streams = await self.ctx.chat.get_private_streams("qq")
+            match_key = "user_id"
+        else:
+            raw_streams = await self.ctx.chat.get_all_streams("qq")
+            match_key = ""
+
+        streams = self._normalize_stream_list(raw_streams)
+        matches: list[dict[str, object]] = []
+        for stream in streams:
+            platform = str(stream.get("platform") or "qq").lower()
+            if platform != "qq":
+                continue
+            if kind == "stream":
+                matched = self._stream_identifier(stream) == requested_target
+            else:
+                matched = str(stream.get(match_key) or "") == requested_target
+            if not matched:
+                continue
+            if requested_account and self._stream_account_id(stream) != requested_account:
+                continue
+            if self._stream_identifier(stream):
+                matches.append(stream)
+
+        unique_matches: dict[str, dict[str, object]] = {
+            self._stream_identifier(stream): stream for stream in matches
+        }
+        matches = list(unique_matches.values())
+        if not matches:
+            raise FileUploadError(
+                "未找到匹配的 QQ 会话；目标必须已经在 MaiBot 中建立聊天流，"
+                "并且 target_id、target_type 和 account_id 必须完全匹配。"
+            )
+        if len(matches) > 1:
+            candidate_accounts = sorted(
+                {
+                    self._stream_account_id(stream)
+                    for stream in matches
+                    if self._stream_account_id(stream)
+                }
+            )
+            suffix = (
+                f" 可选 account_id：{', '.join(candidate_accounts)}。"
+                if candidate_accounts
+                else ""
+            )
+            raise FileUploadError(
+                "有多个 QQ 机器人账号匹配该目标，拒绝猜测；请填写 account_id。"
+                f"{suffix}"
+            )
+
+        stream = matches[0]
+        return self._stream_identifier(stream), kind
+
+    @Tool(
+        "send_server_file_to_qq",
+        brief_description="把服务器上的非敏感普通文件发送到指定 QQ 会话",
+        detailed_description=(
+            "仅当用户明确要求发送某个具体文件时调用，不得主动、批量或猜测性上传。"
+            "target_type 可为 current（当前 QQ 会话）、stream（MaiBot 聊天流 ID）、"
+            "group（QQ群号）或 private（QQ 用户号）；group/private 目标必须已经与"
+            "MaiBot 建立聊天流。多 QQ 机器人账号匹配时必须提供 account_id，绝不能"
+            "自行选择。默认低权限模式只能读取 /work（宿主机 maibot-command-file）"
+            "中的普通文件；受限 ROOT 或完全 ROOT 生效后可读取全系统普通文件。"
+            "无论哪种模式，都绝对禁止上传密码、Token、私钥、Cookie、认证配置、"
+            "数据库、备份、个人信息或其他敏感数据，也不得通过改名、复制、压缩、"
+            "编码等方式绕过；不确定文件是否敏感时必须拒绝调用。内置路径和内容扫描"
+            "只是额外防线，扫描未命中不代表文件安全。符号链接、硬链接、目录、FIFO、"
+            "Socket、设备、空文件、读取中发生变化的文件和超过大小上限的文件都会被拒绝。"
+            "发送失败后的结果可能不确定，不得自动重试，以免 QQ 重复收到文件。"
+        ),
+        parameters=[
+            ToolParameterInfo(
+                name="file_path",
+                param_type=ToolParamType.STRING,
+                description=(
+                    "服务器文件路径。低权限模式使用 /work/文件名或相对路径；"
+                    "ROOT 模式相对路径从 /root 解析，也可使用绝对路径"
+                ),
+                required=True,
+            ),
+            ToolParameterInfo(
+                name="target_type",
+                param_type=ToolParamType.STRING,
+                description="目标类型：current、stream、group 或 private",
+                required=True,
+            ),
+            ToolParameterInfo(
+                name="target_id",
+                param_type=ToolParamType.STRING,
+                description=(
+                    "目标 ID：stream 填聊天流 ID，group 填 QQ 群号，private 填 QQ 号；"
+                    "current 可留空"
+                ),
+                required=False,
+                default="",
+            ),
+            ToolParameterInfo(
+                name="account_id",
+                param_type=ToolParamType.STRING,
+                description="多 QQ 机器人账号匹配时用于消歧的机器人 QQ 号",
+                required=False,
+                default="",
+            ),
+            ToolParameterInfo(
+                name="upload_name",
+                param_type=ToolParamType.STRING,
+                description="可选的 QQ 显示文件名；只能是单个非敏感文件名，不能包含路径",
+                required=False,
+                default="",
+            ),
+        ],
+    )
+    async def handle_send_server_file_to_qq(
+        self,
+        file_path: str,
+        target_type: str,
+        target_id: str = "",
+        account_id: str = "",
+        upload_name: str = "",
+        **kwargs: Any,
+    ) -> dict[str, object]:
+        audit_id = secrets.token_hex(8)
+        if not self.config.file_upload.enabled:
+            self.ctx.logger.warning(
+                "QQ 文件上传被拒绝：upload_id=%s reason=tool_disabled",
+                audit_id,
+            )
+            return {
+                "success": False,
+                "name": "send_server_file_to_qq",
+                "content": "QQ 文件上传工具已被管理员禁用。",
+                "upload_id": audit_id,
+            }
+
+        try:
+            stream_id, resolved_kind = await self._resolve_qq_stream(
+                target_type,
+                target_id,
+                account_id,
+                str(kwargs.get("stream_id") or ""),
+            )
+        except FileUploadError as exc:
+            self.ctx.logger.warning(
+                "QQ 文件上传被拒绝：upload_id=%s reason=target_resolution_failed",
+                audit_id,
+            )
+            return {
+                "success": False,
+                "name": "send_server_file_to_qq",
+                "content": f"QQ 目标会话解析失败，文件未读取也未发送：{exc}",
+                "upload_id": audit_id,
+            }
+        except Exception as exc:
+            self.ctx.logger.error(
+                "QQ 会话查询异常：upload_id=%s error_type=%s",
+                audit_id,
+                type(exc).__name__,
+            )
+            return {
+                "success": False,
+                "name": "send_server_file_to_qq",
+                "content": "QQ 会话查询异常，文件未读取也未发送。",
+                "upload_id": audit_id,
+            }
+
+        root_active, root_reason = self._root_mode_state()
+        unrestricted_active, unrestricted_reason = self._unrestricted_root_state(root_active)
+        if unrestricted_active:
+            execution_mode = "root_unrestricted"
+        elif root_active:
+            execution_mode = "root_restricted"
+        else:
+            execution_mode = "sandbox"
+            if self.config.root_mode.enabled:
+                self.ctx.logger.warning(
+                    "ROOT 配置不完整，QQ 文件上传继续限制在沙箱：upload_id=%s reason=%s",
+                    audit_id,
+                    root_reason,
+                )
+            if self.config.unrestricted_root.enabled:
+                self.ctx.logger.warning(
+                    "完全 ROOT 配置不完整，QQ 文件上传未获得全文件访问："
+                    "upload_id=%s reason=%s",
+                    audit_id,
+                    unrestricted_reason,
+                )
+            if self._sandbox_path is None:
+                try:
+                    self._initialize_sandbox()
+                except Exception as exc:
+                    self._sandbox_error = str(exc)
+                    self.ctx.logger.exception(
+                        "QQ 文件上传失败：沙箱初始化失败：upload_id=%s",
+                        audit_id,
+                    )
+                    return {
+                        "success": False,
+                        "name": "send_server_file_to_qq",
+                        "content": f"沙箱初始化失败，文件未读取也未发送：{exc}",
+                        "upload_id": audit_id,
+                        "execution_mode": execution_mode,
+                    }
+
+        try:
+            prepared = await asyncio.to_thread(
+                prepare_file_upload,
+                str(file_path),
+                sandbox_root=self._sandbox_path,
+                root_mode=root_active,
+                configured_max_mb=self.config.file_upload.max_upload_mb,
+                upload_name=str(upload_name) if upload_name else None,
+            )
+        except FileUploadError as exc:
+            self.ctx.logger.warning(
+                "QQ 文件上传被拒绝：upload_id=%s mode=%s reason=file_validation_failed",
+                audit_id,
+                execution_mode,
+            )
+            return {
+                "success": False,
+                "name": "send_server_file_to_qq",
+                "content": f"文件安全检查未通过，文件未发送：{exc}",
+                "upload_id": audit_id,
+                "execution_mode": execution_mode,
+                "sensitive_file_guard": "enabled",
+            }
+        except Exception as exc:
+            self.ctx.logger.error(
+                "QQ 文件安全检查异常：upload_id=%s mode=%s error_type=%s",
+                audit_id,
+                execution_mode,
+                type(exc).__name__,
+            )
+            return {
+                "success": False,
+                "name": "send_server_file_to_qq",
+                "content": "文件安全检查发生内部异常，文件未发送。",
+                "upload_id": audit_id,
+                "execution_mode": execution_mode,
+                "sensitive_file_guard": "enabled",
+            }
+
+        try:
+            self.ctx.logger.warning(
+                "准备向 QQ 发送服务器文件：upload_id=%s mode=%s scope=%s "
+                "bytes=%s target_type=%s",
+                audit_id,
+                execution_mode,
+                prepared.source_scope,
+                prepared.size,
+                resolved_kind,
+            )
+            send_result = await self.ctx.send.custom(
+                "file",
+                prepared.message_payload(),
+                stream_id,
+                storage_message=False,
+                show_log=False,
+                sync_to_maisaka_history=False,
+            )
+            if send_result is False or (
+                isinstance(send_result, dict) and send_result.get("success") is False
+            ):
+                raise RuntimeError("QQ 适配器返回发送失败")
+        except Exception as exc:
+            self.ctx.logger.error(
+                "QQ 文件发送失败或结果不确定：upload_id=%s mode=%s error_type=%s",
+                audit_id,
+                execution_mode,
+                type(exc).__name__,
+            )
+            return {
+                "success": False,
+                "name": "send_server_file_to_qq",
+                "content": (
+                    "QQ 文件发送失败或结果不确定。"
+                    "请先人工检查目标会话，不要自动重试，以免重复发送。"
+                ),
+                "upload_id": audit_id,
+                "execution_mode": execution_mode,
+                "source_scope": prepared.source_scope,
+                "sensitive_file_guard": "enabled",
+                "retry_safe": False,
+            }
+
+        self.ctx.logger.warning(
+            "QQ 文件发送完成：upload_id=%s mode=%s scope=%s bytes=%s",
+            audit_id,
+            execution_mode,
+            prepared.source_scope,
+            prepared.size,
+        )
+        return {
+            "success": True,
+            "name": "send_server_file_to_qq",
+            "content": (
+                f"文件已发送到指定 QQ 会话：{prepared.name}（{prepared.size} 字节）。"
+                "敏感文件禁令仍然有效；内置扫描通过不代表可忽略人工判断。"
+            ),
+            "upload_id": audit_id,
+            "execution_mode": execution_mode,
+            "source_scope": prepared.source_scope,
+            "sensitive_file_guard": "enabled",
+            "file_name": prepared.name,
+            "file_size": prepared.size,
+            "sha256": prepared.sha256,
+            "target_type": resolved_kind,
+        }
 
     @Tool(
         "run_server_command",
