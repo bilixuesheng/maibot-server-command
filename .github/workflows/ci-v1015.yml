@@ -1,0 +1,67 @@
+name: Temporary v1.0.15 release gate
+
+on:
+  push:
+    branches:
+      - ci/v1.0.15-release-gate-20260729
+    paths-ignore:
+      - ci-v1015-success.json
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    name: SDK ${{ matrix.sdk }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk:
+          - "2.3.0"
+          - "latest"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install operating-system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap openssl openssh-client
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ "${{ matrix.sdk }}" = "latest" ]; then
+            python -m pip install -r requirements.txt
+          else
+            python -m pip install "maibot-plugin-sdk==${{ matrix.sdk }}"
+          fi
+          python -m pip install "ruff==0.12.7"
+      - name: Compile and lint release sources
+        run: |
+          python -m py_compile executor.py file_upload.py plugin.py temp_cleanup.py ci_v1015_validation.py
+          ruff check executor.py file_upload.py plugin.py temp_cleanup.py ci_v1015_validation.py
+      - name: Run real Ubuntu and Bubblewrap validation
+        run: |
+          PYTHON_BIN="$(command -v python)"
+          sudo --preserve-env=PATH "$PYTHON_BIN" ci_v1015_validation.py
+
+  mark-success:
+    name: Record validation success
+    if: ${{ success() }}
+    needs:
+      - validate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ci/v1.0.15-release-gate-20260729
+      - name: Commit success marker
+        run: |
+          printf '%s\n' '{"version":"1.0.15","ubuntu":"24.04","sdk":["2.3.0","latest"],"bubblewrap":true,"status":"passed"}' > ci-v1015-success.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add ci-v1015-success.json
+          git commit -m "ci: record v1.0.15 release gate success"
+          git push origin HEAD:ci/v1.0.15-release-gate-20260729
