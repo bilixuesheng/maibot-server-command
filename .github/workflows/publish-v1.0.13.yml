@@ -1,0 +1,114 @@
+name: Publish v1.0.13
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/publish-v1.0.13.yml
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Ensure release does not already exist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view v1.0.13 --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Release v1.0.13 already exists; refusing to overwrite it." >&2
+            exit 1
+          fi
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/v1.0.13" >/dev/null 2>&1; then
+            echo "Tag v1.0.13 already exists; refusing to overwrite it." >&2
+            exit 1
+          fi
+
+      - name: Check out final plugin source
+        uses: actions/checkout@v4
+        with:
+          ref: b4c7499d9067c49b6e8f1546506bc75dca9ff468
+
+      - name: Build and verify exact release archive
+        run: |
+          mkdir -p release/maibot-server-command/assets
+          cp requirements.txt executor.py README.md .gitignore file_upload.py LICENSE _manifest.json plugin.py release/maibot-server-command/
+          cp assets/icon.png release/maibot-server-command/assets/icon.png
+          find release/maibot-server-command -exec touch -t 202607290800.00 {} +
+          (
+            cd release
+            zip -X -q maibot-server-command-1.0.13.zip               maibot-server-command/               maibot-server-command/requirements.txt               maibot-server-command/executor.py               maibot-server-command/assets/               maibot-server-command/assets/icon.png               maibot-server-command/README.md               maibot-server-command/.gitignore               maibot-server-command/file_upload.py               maibot-server-command/LICENSE               maibot-server-command/_manifest.json               maibot-server-command/plugin.py
+          )
+          echo "078a06945007893d0b10a8173d826f51f5c8752672f53bb6a7dc0d3b60b659fc  release/maibot-server-command-1.0.13.zip" | sha256sum --check --strict
+
+      - name: Write release notes
+        run: |
+          cat > release-notes.md <<'RELEASE_NOTES'
+          ## 版本范围（发布时快照）
+
+          - 最低 MaiBot 版本：1.0.8（插件 Manifest 的实际最低要求）
+          - 发布时最高版本：1.1.2（2026-07-29 发布时 MaiBot 官方最新稳定版本）
+          - Manifest 静态兼容声明：MaiBot 1.0.8 ～ 1.99.99
+          - maibot-plugin-sdk：2.0.0 ～ 2.99.99
+
+          “发布时最高版本”只记录本次发布当天的官方最新稳定版。MaiBot 后续发布新版后，这条历史说明不会自动代表新版已经验证。
+
+          ## 更新日志
+
+          ### 新增：安全发送服务器文件到 QQ
+
+          - 新增 send_server_file_to_qq 工具，可发送到当前会话、聊天流 ID、QQ群或 QQ 私聊。
+          - 支持按 account_id 指定机器人账号；多个账号同时匹配时拒绝猜测，要求明确选择。
+          - 文件先固定读取为字节再交给 MaiBot Host，避免插件与 QQ 适配器不在同一容器时路径失效，也降低发送前文件被替换的风险。
+
+          ### 权限边界
+
+          - 受限沙箱模式只允许读取 maibot-command-file（命令环境中的 /work）内文件。
+          - 受限 ROOT 与完全 ROOT 可读取服务器上的普通文件。
+          - ROOT 新增“允许访问全部文件，并确认服务器没有敏感文件”的独立确认项；从旧版升级后默认关闭，必须由管理员重新确认。
+          - 完全 ROOT 只影响命令正则限制，不会关闭文件上传的敏感信息防护。
+
+          ### 文件安全防护
+
+          - 明确禁止模型发送密码、Token、私钥、Cookie、数据库、个人信息等敏感内容，也禁止通过改名、编码或压缩绕过。
+          - 拒绝路径穿越、符号链接、硬链接、FIFO、设备文件、空文件和读取期间发生变化的文件。
+          - 扫描常见明文秘密、Base64 内容和普通 ZIP；无法可靠检查的加密或嵌套压缩容器直接拒绝。
+          - 默认文件上限 8 MiB，管理员可调但硬上限为 10 MiB，以适配 MaiBot 16 MiB IPC 帧限制。
+          - 文件消息关闭数据库入库、Maisaka 历史同步和内容日志；审计日志不记录文件内容、Base64 或源路径。
+
+          ### Manifest 与文档
+
+          - 声明最小 Host 权限：send.custom、chat.get_all_streams、chat.get_group_streams、chat.get_private_streams。
+          - README 已补充 QQ 目标选择、ROOT 风险确认、敏感文件限制和部署后检查方法。
+          - 发布包不包含 config.toml、测试脚本、GitHub Actions、缓存或旧压缩包。
+
+          ## 验证记录
+
+          - Python 编译、SDK 2.7.1 导入和两个 Tool 声明通过。
+          - 路径逃逸、文件替换、敏感内容、会话歧义及传输持久化等安全检查通过。
+          - 受限 ROOT、完全 ROOT 命令执行分别实跑成功。
+          - 10 MiB 文件的完整请求约 13.98 MiB，低于 16 MiB IPC 单帧上限。
+          - 成品 ZIP 解压复验通过，GitHub 源码与成品文件逐字节一致。
+          - 商店 Manifest 重新验证通过。
+
+          未冒充验证的边界：发布环境没有连接实际 MaiBot、NapCat 和 QQ 账号，因此尚未真实向 QQ 发送文件。安装后应先用明确非敏感的小文件做一次真实发送。
+
+          ## 安全提醒
+
+          ROOT 模式可访问服务器全部普通文件，完全 ROOT 还可执行任意系统命令。仅应由可信管理员开启，并确保服务器不存放模型可读取的敏感文件。敏感信息扫描属于纵深防御，不可能替代服务器权限隔离和人工管理。
+
+          ## 文件校验
+
+          maibot-server-command-1.0.13.zip
+
+          SHA-256: 078a06945007893d0b10a8173d826f51f5c8752672f53bb6a7dc0d3b60b659fc
+          RELEASE_NOTES
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create v1.0.13             release/maibot-server-command-1.0.13.zip             --repo "${GITHUB_REPOSITORY}"             --target b4c7499d9067c49b6e8f1546506bc75dca9ff468             --title "服务器命令执行 v1.0.13"             --notes-file release-notes.md             --latest
