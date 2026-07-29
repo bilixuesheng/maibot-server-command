@@ -1,6 +1,7 @@
 """MaiBot tool plugin for running commands in a fixed Ubuntu sandbox."""
 
 import asyncio
+import contextlib
 import importlib.util
 import os
 import secrets
@@ -15,7 +16,7 @@ from maibot_sdk.types import ToolParameterInfo, ToolParamType
 def _load_sibling_executor() -> Any:
     """Load executor.py without relying on the Runner's sys.path."""
 
-    module_name = "_xuesheng_maibot_server_command_executor_v1_0_13"
+    module_name = "_xuesheng_maibot_server_command_executor_v1_0_14"
     loaded = sys.modules.get(module_name)
     if loaded is not None:
         return loaded
@@ -38,7 +39,7 @@ def _load_sibling_executor() -> Any:
 def _load_sibling_file_upload() -> Any:
     """Load file_upload.py without relying on the Runner's sys.path."""
 
-    module_name = "_xuesheng_maibot_server_command_file_upload_v1_0_13"
+    module_name = "_xuesheng_maibot_server_command_file_upload_v1_0_14"
     loaded = sys.modules.get(module_name)
     if loaded is not None:
         return loaded
@@ -58,19 +59,56 @@ def _load_sibling_file_upload() -> Any:
     return module
 
 
+def _load_sibling_temp_cleanup() -> Any:
+    """Load temp_cleanup.py without relying on the Runner's sys.path."""
+
+    module_name = "_xuesheng_maibot_server_command_temp_cleanup_v1_0_14"
+    loaded = sys.modules.get(module_name)
+    if loaded is not None:
+        return loaded
+
+    cleanup_path = Path(__file__).resolve().with_name("temp_cleanup.py")
+    spec = importlib.util.spec_from_file_location(module_name, cleanup_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"无法加载插件临时文件清理模块：{cleanup_path}")
+
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(module_name, None)
+        raise
+    return module
+
+
 _executor = _load_sibling_executor()
 _file_upload = _load_sibling_file_upload()
+_temp_cleanup = _load_sibling_temp_cleanup()
 SandboxLimits = _executor.SandboxLimits
 command_audit_id = _executor.command_audit_id
 find_maibot_root = _executor.find_maibot_root
 high_risk_command_reason = _executor.high_risk_command_reason
 prepare_sandbox = _executor.prepare_sandbox
+resolve_sandbox_directory = _executor.resolve_sandbox_directory
 resolve_execution_identity = _executor.resolve_execution_identity
 run_command = _executor.run_command
 run_root_command = _executor.run_root_command
 run_unrestricted_root_command = _executor.run_unrestricted_root_command
 FileUploadError = _file_upload.FileUploadError
 prepare_file_upload = _file_upload.prepare_file_upload
+CleanupReport = _temp_cleanup.CleanupReport
+CLEANUP_INTERVAL_SECONDS = _temp_cleanup.CLEANUP_INTERVAL_SECONDS
+ManagedTempTask = _temp_cleanup.ManagedTempTask
+TempCleanupError = _temp_cleanup.TempCleanupError
+cleanup_expired_tasks = _temp_cleanup.cleanup_expired_tasks
+create_managed_temp_task = _temp_cleanup.create_managed_temp_task
+delete_uploaded_managed_file = _temp_cleanup.delete_uploaded_managed_file
+ensure_managed_temp_root = _temp_cleanup.ensure_managed_temp_root
+is_managed_task_name = _temp_cleanup.is_managed_task_name
+reuse_managed_temp_task = _temp_cleanup.reuse_managed_temp_task
+
+TEMP_SESSION_IDLE_SECONDS = 30 * 60
 
 
 ROOT_MODE_NOTICE = (
@@ -216,12 +254,58 @@ class FileUploadConfig(PluginConfigBase):
     )
 
 
+class TemporaryFileCleanupConfig(PluginConfigBase):
+    """控制插件专用临时任务目录的自动清理。"""
+
+    __ui_label__ = "临时文件清理"
+    __ui_icon__ = "trash-2"
+    __ui_order__ = 2
+
+    enabled: bool = Field(
+        default=True,
+        description="是否为命令创建受管临时目录并自动清理",
+        json_schema_extra={
+            "label": "启用受管临时目录",
+            "hint": (
+                "开启后，每个临时任务都会获得独立的 $MAIBOT_TEMP_DIR；"
+                "同一轮任务的连续命令会自动复用。"
+                "只有该目录中的文件会被自动清理；普通 /work 和系统目录永不自动删除。"
+            ),
+            "x-widget": "switch",
+        },
+    )
+    retention_hours: int = Field(
+        default=24,
+        ge=1,
+        le=720,
+        description="临时任务目录在停止使用后的保留时长（1–720 小时）",
+        json_schema_extra={
+            "label": "临时文件保留时长（小时）",
+            "hint": "默认 24 小时；清理器每小时检查一次，因此实际清理时间可能稍晚。",
+            "x-widget": "number",
+            "step": 1,
+        },
+    )
+    delete_after_upload: bool = Field(
+        default=True,
+        description="QQ 明确返回发送成功后立即删除受管临时源文件",
+        json_schema_extra={
+            "label": "QQ 发送成功后立即删除",
+            "hint": (
+                "只删除 $MAIBOT_TEMP_DIR 中且读取后未变化的源文件。"
+                "发送失败、结果不确定、文件变化或任务仍在运行时都会保留。"
+            ),
+            "x-widget": "switch",
+        },
+    )
+
+
 class RootPrivilegeConfig(PluginConfigBase):
     """需要多重确认才能启用的受限 root 模式。"""
 
     __ui_label__ = "受限 ROOT（极高风险）"
     __ui_icon__ = "triangle-alert"
-    __ui_order__ = 2
+    __ui_order__ = 3
 
     enabled: bool = Field(
         default=False,
@@ -291,7 +375,7 @@ class UnrestrictedRootConfig(PluginConfigBase):
 
     __ui_label__ = "完全 ROOT（无命令正则拦截）"
     __ui_icon__ = "skull"
-    __ui_order__ = 3
+    __ui_order__ = 4
 
     enabled: bool = Field(
         default=False,
@@ -408,7 +492,7 @@ class PluginMetadataConfig(PluginConfigBase):
     __ui_order__ = -1
 
     config_version: str = Field(
-        default="1.0.13",
+        default="1.0.14",
         description="配置结构版本",
         json_schema_extra={
             "label": "配置版本",
@@ -424,6 +508,9 @@ class ServerCommandPluginConfig(PluginConfigBase):
     plugin: PluginMetadataConfig = Field(default_factory=PluginMetadataConfig)
     sandbox: CommandSandboxConfig = Field(default_factory=CommandSandboxConfig)
     file_upload: FileUploadConfig = Field(default_factory=FileUploadConfig)
+    temp_cleanup: TemporaryFileCleanupConfig = Field(
+        default_factory=TemporaryFileCleanupConfig
+    )
     root_mode: RootPrivilegeConfig = Field(default_factory=RootPrivilegeConfig)
     unrestricted_root: UnrestrictedRootConfig = Field(default_factory=UnrestrictedRootConfig)
 
@@ -437,6 +524,13 @@ class ServerCommandPlugin(MaiBotPlugin):
         super().__init__()
         self._sandbox_path = None
         self._sandbox_error = ""
+        self._sandbox_prepared_for_low_privilege = False
+        self._managed_temp_root = None
+        self._cleanup_task: asyncio.Task[None] | None = None
+        self._cleanup_lock = asyncio.Lock()
+        self._active_temp_tasks: dict[str, int] = {}
+        self._known_temp_tasks: dict[str, tuple[ManagedTempTask, bool, float]] = {}
+        self._stream_temp_tasks: dict[str, str] = {}
 
     def _root_mode_state(self) -> tuple[bool, str]:
         settings = self.config.root_mode
@@ -513,17 +607,284 @@ class ServerCommandPlugin(MaiBotPlugin):
         payload["descendant_cleanup"] = "on_command_exit_or_timeout"
         return payload
 
-    def _initialize_sandbox(self) -> None:
+    def _initialize_sandbox(self, *, low_privilege: bool | None = None) -> None:
         maibot_root = find_maibot_root(__file__)
-        identity = resolve_execution_identity()
-        self._sandbox_path = prepare_sandbox(maibot_root, identity)
+        if low_privilege is None:
+            root_active, _ = self._root_mode_state()
+            low_privilege = not root_active
+        if low_privilege:
+            identity = resolve_execution_identity()
+            self._sandbox_path = prepare_sandbox(maibot_root, identity)
+            self._sandbox_prepared_for_low_privilege = True
+        else:
+            self._sandbox_path = resolve_sandbox_directory(maibot_root)
+        if self.config.temp_cleanup.enabled:
+            self._managed_temp_root = ensure_managed_temp_root(self._sandbox_path)
+        else:
+            self._managed_temp_root = None
         self._sandbox_error = ""
+
+    async def _run_cleanup_once(self, trigger: str) -> CleanupReport:
+        if not self.config.temp_cleanup.enabled:
+            return CleanupReport()
+        async with self._cleanup_lock:
+            if self._sandbox_path is None or self._managed_temp_root is None:
+                await asyncio.to_thread(self._initialize_sandbox)
+            report = await asyncio.to_thread(
+                cleanup_expired_tasks,
+                self._sandbox_path,
+                retention_hours=self.config.temp_cleanup.retention_hours,
+                active_task_ids=tuple(self._active_temp_tasks),
+            )
+        if (
+            report.deleted_tasks
+            or report.deleted_entries
+            or report.skipped_mounts
+            or report.skipped_unsafe
+            or report.errors
+            or report.budget_exhausted
+        ):
+            self.ctx.logger.info(
+                "受管临时文件清理完成：trigger=%s deleted_tasks=%s "
+                "deleted_entries=%s skipped_active=%s skipped_mounts=%s "
+                "skipped_unsafe=%s errors=%s budget_exhausted=%s",
+                trigger,
+                report.deleted_tasks,
+                report.deleted_entries,
+                report.skipped_active,
+                report.skipped_mounts,
+                report.skipped_unsafe,
+                report.errors,
+                report.budget_exhausted,
+            )
+        return report
+
+    async def _cleanup_loop(self) -> None:
+        while True:
+            await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
+            try:
+                await self._run_cleanup_once("scheduled")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.ctx.logger.error(
+                    "受管临时文件定时清理失败：error_type=%s",
+                    type(exc).__name__,
+                )
+
+    def _start_cleanup_loop(self) -> None:
+        if self._cleanup_task is None or self._cleanup_task.done():
+            self._cleanup_task = asyncio.create_task(
+                self._cleanup_loop(),
+                name="maibot-server-command-temp-cleanup",
+            )
+
+    async def _stop_cleanup_loop(self) -> None:
+        task = self._cleanup_task
+        self._cleanup_task = None
+        if task is None:
+            return
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    async def _refresh_cleanup_service(self, *, run_now: bool) -> None:
+        if not self.config.temp_cleanup.enabled:
+            await self._stop_cleanup_loop()
+            self._managed_temp_root = None
+            return
+        root_active, _ = self._root_mode_state()
+        low_privilege = not root_active
+        if (
+            self._sandbox_path is None
+            or self._managed_temp_root is None
+            or (low_privilege and not self._sandbox_prepared_for_low_privilege)
+        ):
+            await asyncio.to_thread(
+                self._initialize_sandbox,
+                low_privilege=low_privilege,
+            )
+        if run_now:
+            await self._run_cleanup_once("startup_or_config")
+        self._start_cleanup_loop()
+
+    async def _create_command_temp(
+        self,
+        *,
+        root_active: bool,
+        session_key: str,
+        requested_task_id: str,
+        start_new_task: bool,
+    ) -> ManagedTempTask | None:
+        if not self.config.temp_cleanup.enabled:
+            return None
+        async with self._cleanup_lock:
+            if (
+                self._sandbox_path is None
+                or self._managed_temp_root is None
+                or (
+                    not root_active
+                    and not self._sandbox_prepared_for_low_privilege
+                )
+            ):
+                await asyncio.to_thread(
+                    self._initialize_sandbox,
+                    low_privilege=not root_active,
+                )
+            if root_active:
+                command_uid = 0
+                command_gid = 0
+            else:
+                identity = resolve_execution_identity()
+                command_uid = identity.uid
+                command_gid = identity.gid
+
+            requested = str(requested_task_id).strip()
+            stream_key = str(session_key).strip()
+            if requested and start_new_task:
+                raise TempCleanupError(
+                    "temp_task_id 与 start_new_temp_task 不能同时使用。"
+                )
+            if requested and not is_managed_task_name(requested):
+                raise TempCleanupError("temp_task_id 格式无效。")
+
+            now = asyncio.get_running_loop().time()
+            task: ManagedTempTask | None = None
+            explicit_reuse = bool(requested)
+            candidate_id = requested
+            if not candidate_id and not start_new_task and stream_key:
+                session_id = self._stream_temp_tasks.get(stream_key, "")
+                session_record = self._known_temp_tasks.get(session_id)
+                if (
+                    session_record is not None
+                    and session_record[1] == root_active
+                    and now - session_record[2] <= TEMP_SESSION_IDLE_SECONDS
+                ):
+                    candidate_id = session_id
+                elif session_id:
+                    self._stream_temp_tasks.pop(stream_key, None)
+
+            if candidate_id:
+                record = self._known_temp_tasks.get(candidate_id)
+                if record is not None and record[1] != root_active:
+                    if explicit_reuse:
+                        raise TempCleanupError(
+                            "指定临时任务的权限模式与当前命令不一致。"
+                        )
+                    record = None
+                try:
+                    task = await asyncio.to_thread(
+                        reuse_managed_temp_task,
+                        self._sandbox_path,
+                        task_id=candidate_id,
+                        command_uid=command_uid,
+                        command_gid=command_gid,
+                    )
+                except Exception:
+                    self._known_temp_tasks.pop(candidate_id, None)
+                    if explicit_reuse:
+                        raise TempCleanupError(
+                            "指定临时任务不存在、已过期或安全属性发生变化。"
+                        )
+                    task = None
+
+            if task is None:
+                task = await asyncio.to_thread(
+                    create_managed_temp_task,
+                    self._sandbox_path,
+                    command_uid=command_uid,
+                    command_gid=command_gid,
+                )
+            self._known_temp_tasks[task.task_id] = (task, root_active, now)
+            if stream_key:
+                self._stream_temp_tasks[stream_key] = task.task_id
+            self._active_temp_tasks[task.task_id] = (
+                self._active_temp_tasks.get(task.task_id, 0) + 1
+            )
+            return task
+
+    async def _release_command_temp(self, task: ManagedTempTask | None) -> None:
+        if task is None:
+            return
+        async with self._cleanup_lock:
+            remaining = self._active_temp_tasks.get(task.task_id, 0) - 1
+            if remaining > 0:
+                self._active_temp_tasks[task.task_id] = remaining
+            else:
+                self._active_temp_tasks.pop(task.task_id, None)
+            record = self._known_temp_tasks.get(task.task_id)
+            if record is not None:
+                self._known_temp_tasks[task.task_id] = (
+                    record[0],
+                    record[1],
+                    asyncio.get_running_loop().time(),
+                )
+
+    def _decorate_temp_policy(
+        self,
+        payload: dict[str, object],
+        task: ManagedTempTask | None,
+        *,
+        root_active: bool,
+    ) -> dict[str, object]:
+        if task is None:
+            payload["managed_temp_cleanup"] = "disabled"
+            return payload
+        visible_path = os.fspath(task.host_path) if root_active else task.sandbox_path
+        retention_hours = int(self.config.temp_cleanup.retention_hours)
+        payload["managed_temp_cleanup"] = "enabled"
+        payload["managed_temp_dir"] = visible_path
+        payload["temp_task_id"] = task.task_id
+        payload["managed_temp_retention_hours"] = retention_hours
+        payload["managed_temp_delete_after_upload"] = bool(
+            self.config.temp_cleanup.delete_after_upload
+        )
+        payload["content"] = (
+            f"{payload.get('content', '')}\n\n"
+            f"临时文件目录：{visible_path}（环境变量 $MAIBOT_TEMP_DIR）。"
+            f"临时内容默认保留 {retention_hours} 小时；"
+            "需要长期保留的成果必须移出该目录。"
+            + (
+                "其中的文件经 QQ 明确发送成功且未发生变化后会立即删除。"
+                if self.config.temp_cleanup.delete_after_upload
+                else "管理员已关闭 QQ 发送成功后的立即删除。"
+            )
+            + "绝不能把系统目录或普通 /work 文件当作可自动清理对象。"
+        )
+        return payload
+
+    async def _delete_uploaded_temp_file(self, prepared: Any) -> str:
+        if (
+            not self.config.temp_cleanup.enabled
+            or not self.config.temp_cleanup.delete_after_upload
+            or prepared.cleanup_relative_parts is None
+            or prepared.cleanup_identity is None
+        ):
+            return "not_requested"
+        async with self._cleanup_lock:
+            if self._sandbox_path is None or self._managed_temp_root is None:
+                return "cleanup_unavailable"
+            return await asyncio.to_thread(
+                delete_uploaded_managed_file,
+                self._sandbox_path,
+                relative_parts=prepared.cleanup_relative_parts,
+                expected_identity=prepared.cleanup_identity,
+                active_task_ids=tuple(self._active_temp_tasks),
+            )
 
     async def on_load(self) -> None:
         root_active, root_reason = self._root_mode_state()
         unrestricted_active, unrestricted_reason = self._unrestricted_root_state(root_active)
+        if self.config.temp_cleanup.enabled:
+            try:
+                await self._refresh_cleanup_service(run_now=True)
+            except Exception as exc:
+                self._managed_temp_root = None
+                self.ctx.logger.error(
+                    "受管临时文件服务初始化失败：error_type=%s",
+                    type(exc).__name__,
+                )
         if unrestricted_active:
-            self._sandbox_path = None
             self._sandbox_error = ""
             self.ctx.logger.critical(
                 "完全 ROOT 模式已启用：sandbox=disabled cwd=/root regex_guard=disabled；"
@@ -536,7 +897,6 @@ class ServerCommandPlugin(MaiBotPlugin):
                 unrestricted_reason,
             )
         if root_active:
-            self._sandbox_path = None
             self._sandbox_error = ""
             self.ctx.logger.critical(
                 "受限 ROOT 模式已启用：沙箱已关闭，命令将以 root 在 /root 执行；"
@@ -549,9 +909,14 @@ class ServerCommandPlugin(MaiBotPlugin):
                 root_reason,
             )
         try:
-            self._initialize_sandbox()
+            if (
+                self._sandbox_path is None
+                or not self._sandbox_prepared_for_low_privilege
+            ):
+                self._initialize_sandbox(low_privilege=True)
         except Exception as exc:
             self._sandbox_path = None
+            self._sandbox_prepared_for_low_privilege = False
             self._sandbox_error = str(exc)
             self.ctx.logger.exception(
                 "命令沙箱初始化暂不可用，插件仍会加载并在调用时重试：error=%s",
@@ -569,11 +934,22 @@ class ServerCommandPlugin(MaiBotPlugin):
             )
 
     async def on_unload(self) -> None:
+        await self._stop_cleanup_loop()
+        self._active_temp_tasks.clear()
+        self._known_temp_tasks.clear()
+        self._stream_temp_tasks.clear()
         self.ctx.logger.info("命令沙箱插件已卸载")
 
     async def on_config_update(self, scope: str, config_data: dict[str, object], version: str) -> None:
         del config_data
         if scope == CONFIG_RELOAD_SCOPE_SELF:
+            try:
+                await self._refresh_cleanup_service(run_now=True)
+            except Exception as exc:
+                self.ctx.logger.error(
+                    "配置更新后受管临时文件服务不可用：error_type=%s",
+                    type(exc).__name__,
+                )
             root_active, root_reason = self._root_mode_state()
             unrestricted_active, unrestricted_reason = self._unrestricted_root_state(root_active)
             if unrestricted_active:
@@ -619,6 +995,32 @@ class ServerCommandPlugin(MaiBotPlugin):
         if not isinstance(value, list):
             return []
         return [item for item in value if isinstance(item, dict)]
+
+    @staticmethod
+    def _tool_temp_session_key(
+        stream_id: str,
+        message: Any,
+    ) -> str:
+        """Scope automatic reuse to one triggering message when possible."""
+
+        normalized_stream = str(stream_id).strip()
+        message_id = ""
+        if isinstance(message, dict):
+            message_id = str(
+                message.get("message_id")
+                or message.get("id")
+                or ""
+            ).strip()
+            message_info = message.get("message_info")
+            if not message_id and isinstance(message_info, dict):
+                message_id = str(
+                    message_info.get("message_id")
+                    or message_info.get("id")
+                    or ""
+                ).strip()
+        if normalized_stream and message_id:
+            return f"{normalized_stream}\x1f{message_id}"
+        return normalized_stream
 
     async def _resolve_qq_stream(
         self,
@@ -717,7 +1119,10 @@ class ServerCommandPlugin(MaiBotPlugin):
             "编码等方式绕过；不确定文件是否敏感时必须拒绝调用。内置路径和内容扫描"
             "只是额外防线，扫描未命中不代表文件安全。符号链接、硬链接、目录、FIFO、"
             "Socket、设备、空文件、读取中发生变化的文件和超过大小上限的文件都会被拒绝。"
-            "发送失败后的结果可能不确定，不得自动重试，以免 QQ 重复收到文件。"
+            "若文件来自 $MAIBOT_TEMP_DIR，且 QQ 明确返回发送成功、文件身份未变化、"
+            "任务也已结束，插件会按管理员配置立即删除该临时源文件；普通 /work、"
+            "/root、/etc 等路径永不因此自动删除。发送失败或结果不确定时必须保留，"
+            "也不得自动重试，以免 QQ 重复收到文件。"
         ),
         parameters=[
             ToolParameterInfo(
@@ -835,9 +1240,12 @@ class ServerCommandPlugin(MaiBotPlugin):
                     audit_id,
                     unrestricted_reason,
                 )
-            if self._sandbox_path is None:
+            if (
+                self._sandbox_path is None
+                or not self._sandbox_prepared_for_low_privilege
+            ):
                 try:
-                    self._initialize_sandbox()
+                    self._initialize_sandbox(low_privilege=True)
                 except Exception as exc:
                     self._sandbox_error = str(exc)
                     self.ctx.logger.exception(
@@ -852,6 +1260,19 @@ class ServerCommandPlugin(MaiBotPlugin):
                         "execution_mode": execution_mode,
                     }
 
+        if self.config.temp_cleanup.enabled and self._managed_temp_root is None:
+            try:
+                await asyncio.to_thread(
+                    self._initialize_sandbox,
+                    low_privilege=not root_active,
+                )
+            except Exception as exc:
+                self.ctx.logger.error(
+                    "QQ 上传前无法初始化受管临时目录：upload_id=%s error_type=%s",
+                    audit_id,
+                    type(exc).__name__,
+                )
+
         try:
             prepared = await asyncio.to_thread(
                 prepare_file_upload,
@@ -860,6 +1281,7 @@ class ServerCommandPlugin(MaiBotPlugin):
                 root_mode=root_active,
                 configured_max_mb=self.config.file_upload.max_upload_mb,
                 upload_name=str(upload_name) if upload_name else None,
+                managed_temp_root=self._managed_temp_root,
             )
         except FileUploadError as exc:
             self.ctx.logger.warning(
@@ -909,10 +1331,11 @@ class ServerCommandPlugin(MaiBotPlugin):
                 show_log=False,
                 sync_to_maisaka_history=False,
             )
-            if send_result is False or (
-                isinstance(send_result, dict) and send_result.get("success") is False
-            ):
-                raise RuntimeError("QQ 适配器返回发送失败")
+            confirmed_success = send_result is True or (
+                isinstance(send_result, dict) and send_result.get("success") is True
+            )
+            if not confirmed_success:
+                raise RuntimeError("QQ 适配器未明确确认发送成功")
         except Exception as exc:
             self.ctx.logger.error(
                 "QQ 文件发送失败或结果不确定：upload_id=%s mode=%s error_type=%s",
@@ -932,20 +1355,49 @@ class ServerCommandPlugin(MaiBotPlugin):
                 "source_scope": prepared.source_scope,
                 "sensitive_file_guard": "enabled",
                 "retry_safe": False,
+                "temporary_file_cleanup": "retained_send_unconfirmed",
             }
 
+        try:
+            cleanup_status = await self._delete_uploaded_temp_file(prepared)
+        except Exception as exc:
+            cleanup_status = "cleanup_failed"
+            self.ctx.logger.error(
+                "QQ 已明确发送成功，但临时源文件清理异常："
+                "upload_id=%s mode=%s error_type=%s",
+                audit_id,
+                execution_mode,
+                type(exc).__name__,
+            )
         self.ctx.logger.warning(
-            "QQ 文件发送完成：upload_id=%s mode=%s scope=%s bytes=%s",
+            "QQ 文件发送完成：upload_id=%s mode=%s scope=%s bytes=%s "
+            "temporary_cleanup=%s",
             audit_id,
             execution_mode,
             prepared.source_scope,
             prepared.size,
+            cleanup_status,
         )
+        if cleanup_status in {"deleted", "deleted_file_prune_failed"}:
+            cleanup_notice = "该文件来自受管临时目录，发送成功后源文件已安全删除。"
+        elif (
+            prepared.cleanup_relative_parts is not None
+            and not self.config.temp_cleanup.delete_after_upload
+        ):
+            cleanup_notice = "该文件来自受管临时目录，但管理员已关闭发送成功后的立即删除。"
+        elif prepared.cleanup_relative_parts is not None:
+            cleanup_notice = (
+                "该文件来自受管临时目录，但因任务仍活动、文件变化或清理不可用而保留；"
+                "之后仍会按保留期限检查。"
+            )
+        else:
+            cleanup_notice = "源文件不属于受管临时目录，插件没有删除它。"
         return {
             "success": True,
             "name": "send_server_file_to_qq",
             "content": (
                 f"文件已发送到指定 QQ 会话：{prepared.name}（{prepared.size} 字节）。"
+                f"{cleanup_notice}"
                 "敏感文件禁令仍然有效；内置扫描通过不代表可忽略人工判断。"
             ),
             "upload_id": audit_id,
@@ -956,6 +1408,7 @@ class ServerCommandPlugin(MaiBotPlugin):
             "file_size": prepared.size,
             "sha256": prepared.sha256,
             "target_type": resolved_kind,
+            "temporary_file_cleanup": cleanup_status,
         }
 
     @Tool(
@@ -970,6 +1423,13 @@ class ServerCommandPlugin(MaiBotPlugin):
             "数据外传命令；不确定是否安全时不要调用。"
             "低权限沙箱由管理员的联网开关控制；两种 ROOT 模式直接使用宿主机网络，"
             "不受该联网开关限制。"
+            "启用临时清理后，每个临时任务都有独立的 $MAIBOT_TEMP_DIR；短期中间文件应"
+            "只写入这个环境变量指向的目录。同一条用户消息触发的连续命令会自动复用；"
+            "若运行时没有消息 ID，则同一会话在 30 分钟空闲租约内复用。也可以把上一"
+            "条结果的 temp_task_id 传给下一条命令，以跨消息明确继续同一任务。只有"
+            "明确开始新任务时才设置 start_new_temp_task=true。"
+            "需要保留的成果必须放到普通 /work 或管理员指定的持久位置。不得把其他"
+            "目录中的文件当成可自动清理文件。"
             "调用前先根据返回的权限模式判断实际边界。"
         ),
         parameters=[
@@ -986,15 +1446,41 @@ class ServerCommandPlugin(MaiBotPlugin):
                 required=False,
                 default=20,
             ),
+            ToolParameterInfo(
+                name="temp_task_id",
+                param_type=ToolParamType.STRING,
+                description=(
+                    "可选的受管临时任务 ID。需要多条命令继续使用同一批临时文件时，"
+                    "传入上一条结果返回的 temp_task_id；不得自行编造"
+                ),
+                required=False,
+                default="",
+            ),
+            ToolParameterInfo(
+                name="start_new_temp_task",
+                param_type=ToolParamType.BOOLEAN,
+                description=(
+                    "是否明确开始新的临时任务。仅当上一任务已结束且不应复用其目录时设为 true；"
+                    "不能与 temp_task_id 同时使用"
+                ),
+                required=False,
+                default=False,
+            ),
         ],
     )
     async def handle_run_server_command(
         self,
         command: str,
         timeout_seconds: int = 20,
+        temp_task_id: str = "",
+        start_new_temp_task: bool = False,
         **kwargs: Any,
     ) -> dict[str, object]:
-        del kwargs
+        current_stream_id = str(kwargs.get("stream_id") or "")
+        temp_session_key = self._tool_temp_session_key(
+            current_stream_id,
+            kwargs.get("message"),
+        )
         if not self.config.sandbox.enabled:
             self.ctx.logger.warning("麦麦调用沙箱命令被拒绝：工具已被管理员禁用")
             return {
@@ -1016,6 +1502,30 @@ class ServerCommandPlugin(MaiBotPlugin):
         )
         if unrestricted_active:
             try:
+                temp_task = await self._create_command_temp(
+                    root_active=True,
+                    session_key=temp_session_key,
+                    requested_task_id=temp_task_id,
+                    start_new_task=bool(start_new_temp_task),
+                )
+            except Exception as exc:
+                self.ctx.logger.error(
+                    "完全 ROOT 命令未执行：受管临时目录不可用："
+                    "command_id=%s error_type=%s",
+                    audit_id,
+                    type(exc).__name__,
+                )
+                return {
+                    "success": False,
+                    "name": "run_server_command",
+                    "content": (
+                        f"{UNRESTRICTED_ROOT_NOTICE}\n\n"
+                        "受管临时目录初始化失败，命令未执行。"
+                    ),
+                    "execution_mode": "root_unrestricted",
+                    "managed_temp_cleanup": "unavailable",
+                }
+            try:
                 self.ctx.logger.critical(
                     "麦麦准备执行完全 ROOT 命令：command_id=%s cwd=/root "
                     "regex_guard=disabled timeout=%ss",
@@ -1026,6 +1536,9 @@ class ServerCommandPlugin(MaiBotPlugin):
                     str(command),
                     limits,
                     requested_timeout=timeout_seconds,
+                    managed_temp_directory=(
+                        os.fspath(temp_task.host_path) if temp_task is not None else None
+                    ),
                 )
                 if result.timed_out:
                     self.ctx.logger.warning(
@@ -1044,14 +1557,14 @@ class ServerCommandPlugin(MaiBotPlugin):
                         "完全 ROOT 命令执行成功：command_id=%s exit_code=0",
                         audit_id,
                     )
-                return self._unrestricted_root_result(result)
+                payload = self._unrestricted_root_result(result)
             except Exception as exc:
                 self.ctx.logger.exception(
                     "完全 ROOT 命令未执行或插件异常：command_id=%s error=%s",
                     audit_id,
                     exc,
                 )
-                return {
+                payload = {
                     "success": False,
                     "name": "run_server_command",
                     "content": f"{UNRESTRICTED_ROOT_NOTICE}\n\n命令未执行：{exc}",
@@ -1061,6 +1574,13 @@ class ServerCommandPlugin(MaiBotPlugin):
                     "process_limit": "not_enforced_for_uid_0",
                     "descendant_cleanup": "on_command_exit_or_timeout",
                 }
+            finally:
+                await self._release_command_temp(temp_task)
+            return self._decorate_temp_policy(
+                payload,
+                temp_task,
+                root_active=True,
+            )
 
         if self.config.unrestricted_root.enabled:
             self.ctx.logger.warning(
@@ -1090,6 +1610,30 @@ class ServerCommandPlugin(MaiBotPlugin):
                     "descendant_cleanup": "on_command_exit_or_timeout",
                 }
             try:
+                temp_task = await self._create_command_temp(
+                    root_active=True,
+                    session_key=temp_session_key,
+                    requested_task_id=temp_task_id,
+                    start_new_task=bool(start_new_temp_task),
+                )
+            except Exception as exc:
+                self.ctx.logger.error(
+                    "受限 ROOT 命令未执行：受管临时目录不可用："
+                    "command_id=%s error_type=%s",
+                    audit_id,
+                    type(exc).__name__,
+                )
+                return {
+                    "success": False,
+                    "name": "run_server_command",
+                    "content": (
+                        f"{ROOT_MODE_NOTICE}\n\n"
+                        "受管临时目录初始化或复用失败，命令未执行。"
+                    ),
+                    "execution_mode": "root_restricted",
+                    "managed_temp_cleanup": "unavailable",
+                }
+            try:
                 self.ctx.logger.critical(
                     "麦麦准备执行受限 ROOT 命令：command_id=%s cwd=/root timeout=%ss",
                     audit_id,
@@ -1099,6 +1643,9 @@ class ServerCommandPlugin(MaiBotPlugin):
                     str(command),
                     limits,
                     requested_timeout=timeout_seconds,
+                    managed_temp_directory=(
+                        os.fspath(temp_task.host_path) if temp_task is not None else None
+                    ),
                 )
                 if result.timed_out:
                     self.ctx.logger.warning(
@@ -1117,14 +1664,14 @@ class ServerCommandPlugin(MaiBotPlugin):
                         "受限 ROOT 命令执行成功：command_id=%s exit_code=0",
                         audit_id,
                     )
-                return self._root_result(result)
+                payload = self._root_result(result)
             except Exception as exc:
                 self.ctx.logger.exception(
                     "受限 ROOT 命令被拒绝或插件异常：command_id=%s error=%s",
                     audit_id,
                     exc,
                 )
-                return {
+                payload = {
                     "success": False,
                     "name": "run_server_command",
                     "content": f"{ROOT_MODE_NOTICE}\n\n命令未执行：{exc}",
@@ -1134,15 +1681,25 @@ class ServerCommandPlugin(MaiBotPlugin):
                     "process_limit": "not_enforced_for_uid_0",
                     "descendant_cleanup": "on_command_exit_or_timeout",
                 }
+            finally:
+                await self._release_command_temp(temp_task)
+            return self._decorate_temp_policy(
+                payload,
+                temp_task,
+                root_active=True,
+            )
 
         if self.config.root_mode.enabled:
             self.ctx.logger.warning(
                 "受限 ROOT 配置不完整，本次继续使用低权限沙箱：reason=%s",
                 root_reason,
             )
-        if self._sandbox_path is None:
+        if (
+            self._sandbox_path is None
+            or not self._sandbox_prepared_for_low_privilege
+        ):
             try:
-                self._initialize_sandbox()
+                self._initialize_sandbox(low_privilege=True)
             except Exception as exc:
                 self._sandbox_error = str(exc)
                 self.ctx.logger.exception("麦麦调用沙箱命令失败：沙箱初始化失败：error=%s", exc)
@@ -1151,6 +1708,28 @@ class ServerCommandPlugin(MaiBotPlugin):
                     "name": "run_server_command",
                     "content": f"沙箱初始化失败，命令未执行：{exc}",
                 }
+
+        try:
+            temp_task = await self._create_command_temp(
+                root_active=False,
+                session_key=temp_session_key,
+                requested_task_id=temp_task_id,
+                start_new_task=bool(start_new_temp_task),
+            )
+        except Exception as exc:
+            self.ctx.logger.error(
+                "沙箱命令未执行：受管临时目录不可用："
+                "command_id=%s error_type=%s",
+                audit_id,
+                type(exc).__name__,
+            )
+            return {
+                "success": False,
+                "name": "run_server_command",
+                "content": "受管临时目录初始化或复用失败，命令未执行。",
+                "execution_mode": "sandbox",
+                "managed_temp_cleanup": "unavailable",
+            }
 
         try:
             self.ctx.logger.info(
@@ -1165,6 +1744,9 @@ class ServerCommandPlugin(MaiBotPlugin):
                 limits,
                 requested_timeout=timeout_seconds,
                 network_enabled=settings.network_enabled,
+                managed_temp_directory=(
+                    temp_task.sandbox_path if temp_task is not None else None
+                ),
             )
             if result.timed_out:
                 self.ctx.logger.warning(
@@ -1183,18 +1765,25 @@ class ServerCommandPlugin(MaiBotPlugin):
                     "沙箱命令执行成功：command_id=%s exit_code=0",
                     audit_id,
                 )
-            return result.as_dict()
+            payload = result.as_dict()
         except Exception as exc:
             self.ctx.logger.exception(
                 "沙箱命令被拒绝或插件异常：command_id=%s error=%s",
                 audit_id,
                 exc,
             )
-            return {
+            payload = {
                 "success": False,
                 "name": "run_server_command",
                 "content": f"命令未执行：{exc}",
             }
+        finally:
+            await self._release_command_temp(temp_task)
+        return self._decorate_temp_policy(
+            payload,
+            temp_task,
+            root_active=False,
+        )
 
 
 def create_plugin() -> ServerCommandPlugin:

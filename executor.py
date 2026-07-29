@@ -29,6 +29,7 @@ ROOT_SANDBOX_USER: Final = "nobody"
 ROOT_WORKING_DIRECTORY: Final = Path("/root")
 ROOT_SUPERVISOR_FLAG: Final = "--maibot-root-supervisor"
 ROOT_SUPERVISOR_GRACE_SECONDS: Final = 5.0
+MANAGED_TEMP_DIRECTORY_NAME: Final = ".maibot-temp"
 
 
 _HIGH_RISK_COMMAND_RULES: Final = (
@@ -235,17 +236,18 @@ def _chown_sandbox_tree(sandbox: Path, identity: ExecutionIdentity) -> None:
     for directory, dir_names, file_names in os.walk(sandbox, followlinks=False):
         base = Path(directory)
         os.chown(base, identity.uid, identity.gid, follow_symlinks=False)
+        if base == sandbox and MANAGED_TEMP_DIRECTORY_NAME in dir_names:
+            # Task directories preserve their execution-mode owner. The
+            # root-owned 0711 parent permits traversal only when the caller
+            # already knows its unguessable task ID.
+            dir_names.remove(MANAGED_TEMP_DIRECTORY_NAME)
         for name in [*dir_names, *file_names]:
             os.chown(base / name, identity.uid, identity.gid, follow_symlinks=False)
 
 
-def prepare_sandbox(
-    maibot_root: Path,
-    identity: ExecutionIdentity | None = None,
-) -> Path:
-    """Create and validate the one writable host directory."""
+def resolve_sandbox_directory(maibot_root: Path) -> Path:
+    """Create and path-validate the writable directory without changing owners."""
 
-    execution_identity = identity or resolve_execution_identity()
     root = maibot_root.resolve(strict=True)
     candidate = root / "maibot-command-file"
     if candidate.exists() or candidate.is_symlink():
@@ -258,6 +260,17 @@ def prepare_sandbox(
     sandbox = candidate.resolve(strict=True)
     if sandbox.parent != root:
         raise SandboxError("沙箱目录解析后越出了 MaiBot 主程序目录。")
+    return sandbox
+
+
+def prepare_sandbox(
+    maibot_root: Path,
+    identity: ExecutionIdentity | None = None,
+) -> Path:
+    """Create, validate and transfer the writable low-privilege directory."""
+
+    execution_identity = identity or resolve_execution_identity()
+    sandbox = resolve_sandbox_directory(maibot_root)
     if execution_identity.drop_from_root:
         _chown_sandbox_tree(sandbox, execution_identity)
         os.chmod(sandbox, 0o700)
@@ -335,6 +348,7 @@ def build_bwrap_argv(
     identity: ExecutionIdentity,
     sandbox_fd: int | None = None,
     network_enabled: bool = False,
+    managed_temp_directory: str | None = None,
 ) -> list[str]:
     """Build an argv without interpolating the untrusted command into options."""
 
@@ -422,6 +436,14 @@ def build_bwrap_argv(
         "LANG",
         "C",
     ]
+    if managed_temp_directory:
+        environment_args.extend(
+            (
+                "--setenv",
+                "MAIBOT_TEMP_DIR",
+                str(managed_temp_directory),
+            )
+        )
     if network_enabled:
         environment_args.extend(
             (
@@ -684,6 +706,9 @@ def _root_supervisor_main(command: str, limits: SandboxLimits) -> int:
                 "LOGNAME": "root",
                 "LANG": "C.UTF-8",
             }
+            managed_temp_directory = os.environ.get("MAIBOT_TEMP_DIR", "")
+            if managed_temp_directory:
+                environment["MAIBOT_TEMP_DIR"] = managed_temp_directory
             os.execve(
                 "/bin/bash",
                 ["/bin/bash", "--noprofile", "--norc", "-c", command],
@@ -775,6 +800,7 @@ async def run_command(
     limits: SandboxLimits,
     requested_timeout: int | None = None,
     network_enabled: bool = False,
+    managed_temp_directory: str | None = None,
 ) -> CommandResult:
     """Run a shell command inside a fail-closed Bubblewrap sandbox."""
 
@@ -810,6 +836,7 @@ async def run_command(
         identity,
         sandbox_fd=sandbox_fd,
         network_enabled=bool(network_enabled),
+        managed_temp_directory=managed_temp_directory,
     )
     try:
         process = await asyncio.create_subprocess_exec(
@@ -865,6 +892,7 @@ async def _run_root_command(
     requested_timeout: int | None = None,
     *,
     enforce_high_risk_guard: bool,
+    managed_temp_directory: str | None = None,
 ) -> CommandResult:
     """Run an explicitly confirmed command as root in /root without Bubblewrap."""
 
@@ -886,6 +914,14 @@ async def _run_root_command(
         timeout = max(1, min(int(requested_timeout), timeout))
 
     supervisor_path = str(Path(__file__).resolve(strict=True))
+    supervisor_environment = {
+        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "HOME": "/root",
+        "LANG": "C.UTF-8",
+    }
+    if managed_temp_directory:
+        supervisor_environment["MAIBOT_TEMP_DIR"] = str(managed_temp_directory)
+
     process = await asyncio.create_subprocess_exec(
         sys.executable,
         supervisor_path,
@@ -897,11 +933,7 @@ async def _run_root_command(
         str(normalized.max_processes),
         command,
         cwd=str(ROOT_WORKING_DIRECTORY),
-        env={
-            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-            "HOME": "/root",
-            "LANG": "C.UTF-8",
-        },
+        env=supervisor_environment,
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -943,6 +975,7 @@ async def run_root_command(
     command: str,
     limits: SandboxLimits,
     requested_timeout: int | None = None,
+    managed_temp_directory: str | None = None,
 ) -> CommandResult:
     """Run a restricted-root command after applying the high-risk regex guard."""
 
@@ -951,6 +984,7 @@ async def run_root_command(
         limits,
         requested_timeout=requested_timeout,
         enforce_high_risk_guard=True,
+        managed_temp_directory=managed_temp_directory,
     )
 
 
@@ -958,6 +992,7 @@ async def run_unrestricted_root_command(
     command: str,
     limits: SandboxLimits,
     requested_timeout: int | None = None,
+    managed_temp_directory: str | None = None,
 ) -> CommandResult:
     """Run a fully confirmed root command without the high-risk regex guard.
 
@@ -971,6 +1006,7 @@ async def run_unrestricted_root_command(
         limits,
         requested_timeout=requested_timeout,
         enforce_high_risk_guard=False,
+        managed_temp_directory=managed_temp_directory,
     )
 
 

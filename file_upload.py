@@ -150,6 +150,7 @@ _BASE64_BLOCK_RE = re.compile(
     rb"(?:[A-Za-z0-9+/_-]{4}){8,}(?:[A-Za-z0-9+/_-]{2}==|[A-Za-z0-9+/_-]{3}=)?"
     rb"(?![A-Za-z0-9+/=_-])"
 )
+_MANAGED_TASK_RE = re.compile(r"task-[0-9a-f]{32}\Z")
 
 
 class FileUploadError(ValueError):
@@ -166,6 +167,8 @@ class PreparedUpload:
     sha256: str
     base64_url: str
     source_scope: str
+    cleanup_relative_parts: tuple[str, ...] | None = None
+    cleanup_identity: tuple[int, int, int, int, int, int, int] | None = None
 
     def message_payload(self) -> dict[str, object]:
         return {
@@ -488,6 +491,46 @@ def _read_pinned_regular_file(file_fd: int, max_bytes: int) -> tuple[bytes, os.s
     return b"".join(chunks), after
 
 
+def _managed_cleanup_metadata(
+    resolved_path: str,
+    managed_temp_root: Path | None,
+    file_stat: os.stat_result,
+) -> tuple[
+    tuple[str, ...] | None,
+    tuple[int, int, int, int, int, int, int] | None,
+]:
+    """Identify an unchanged file inside a plugin-created temporary task."""
+
+    if managed_temp_root is None:
+        return None, None
+    try:
+        root = Path(managed_temp_root).resolve(strict=True)
+        root_stat = root.stat()
+        resolved = Path(resolved_path).resolve(strict=True)
+        relative = resolved.relative_to(root)
+    except (OSError, RuntimeError, ValueError):
+        return None, None
+
+    parts = tuple(relative.parts)
+    if (
+        len(parts) < 2
+        or _MANAGED_TASK_RE.fullmatch(parts[0]) is None
+        or any(part in {"", ".", ".."} for part in parts)
+        or file_stat.st_dev != root_stat.st_dev
+    ):
+        return None, None
+    identity = (
+        int(file_stat.st_dev),
+        int(file_stat.st_ino),
+        int(file_stat.st_mode),
+        int(file_stat.st_nlink),
+        int(file_stat.st_size),
+        int(file_stat.st_mtime_ns),
+        int(file_stat.st_ctime_ns),
+    )
+    return parts, identity
+
+
 def prepare_file_upload(
     path_text: str,
     *,
@@ -495,6 +538,7 @@ def prepare_file_upload(
     root_mode: bool,
     configured_max_mb: int,
     upload_name: str | None = None,
+    managed_temp_root: Path | None = None,
 ) -> PreparedUpload:
     """Open, verify, scan and pin a file before the caller sends it."""
 
@@ -514,7 +558,7 @@ def prepare_file_upload(
             path_reason = sensitive_path_reason(checked_path)
             if path_reason is not None:
                 raise FileUploadError(f"拒绝上传敏感文件：{path_reason}。")
-        data, _ = _read_pinned_regular_file(file_fd, max_bytes)
+        data, stable_stat = _read_pinned_regular_file(file_fd, max_bytes)
     finally:
         os.close(file_fd)
 
@@ -526,6 +570,11 @@ def prepare_file_upload(
     mime_type = mimetypes.guess_type(safe_name)[0] or "application/octet-stream"
     digest = hashlib.sha256(data).hexdigest()
     encoded = base64.b64encode(data).decode("ascii")
+    cleanup_relative_parts, cleanup_identity = _managed_cleanup_metadata(
+        resolved_path,
+        managed_temp_root,
+        stable_stat,
+    )
     return PreparedUpload(
         name=safe_name,
         size=len(data),
@@ -533,4 +582,6 @@ def prepare_file_upload(
         sha256=digest,
         base64_url=f"base64://{encoded}",
         source_scope=source_scope,
+        cleanup_relative_parts=cleanup_relative_parts,
+        cleanup_identity=cleanup_identity,
     )
