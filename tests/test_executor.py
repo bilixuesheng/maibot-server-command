@@ -9,6 +9,7 @@ import shlex
 import shutil
 import stat
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -286,9 +287,7 @@ def test_root_launcher_enters_work_only_after_setpriv(tmp_path: Path) -> None:
     ]
 
 
-def test_setpriv_wrapper_can_enter_nobody_owned_0700_directory(
-    tmp_path: Path,
-) -> None:
+def test_setpriv_wrapper_can_enter_nobody_owned_0700_directory() -> None:
     if os.geteuid() != 0:
         pytest.skip("此回归测试需要 root 才能切换到 nobody")
     setpriv = shutil.which("setpriv")
@@ -296,45 +295,50 @@ def test_setpriv_wrapper_can_enter_nobody_owned_0700_directory(
         pytest.skip("系统没有 setpriv")
 
     account = pwd.getpwnam("nobody")
-    work = tmp_path / "work"
-    work.mkdir()
-    os.chmod(tmp_path, 0o755)
-    try:
-        os.chown(work, account.pw_uid, account.pw_gid)
-    except OSError as exc:
-        if exc.errno in {errno.EPERM, errno.EINVAL}:
-            pytest.skip("当前容器不映射 nobody，无法执行真实降权目录测试")
-        raise
-    os.chmod(work, 0o700)
+    with tempfile.TemporaryDirectory(
+        prefix="maibot-setpriv-test-",
+        dir="/tmp",
+    ) as temporary_directory:
+        base = Path(temporary_directory)
+        os.chmod(base, 0o755)
+        work = base / "work"
+        work.mkdir()
+        try:
+            os.chown(work, account.pw_uid, account.pw_gid)
+        except OSError as exc:
+            if exc.errno in {errno.EPERM, errno.EINVAL}:
+                pytest.skip("当前容器不映射 nobody，无法执行真实降权目录测试")
+            raise
+        os.chmod(work, 0o700)
 
-    completed = subprocess.run(
-        [
-            setpriv,
-            "--reuid",
-            str(account.pw_uid),
-            "--regid",
-            str(account.pw_gid),
-            "--clear-groups",
-            "--inh-caps=-all",
-            "--ambient-caps=-all",
-            "--bounding-set=-all",
-            "--no-new-privs",
-            "/usr/bin/env",
-            f"--chdir={work}",
-            "/bin/bash",
-            "--noprofile",
-            "--norc",
-            "-c",
-            "pwd; id -u; touch created-by-command",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert completed.returncode == 0, completed.stderr
-    lines = completed.stdout.splitlines()
-    assert lines == [str(work), str(account.pw_uid)]
-    assert (work / "created-by-command").stat().st_uid == account.pw_uid
+        completed = subprocess.run(
+            [
+                setpriv,
+                "--reuid",
+                str(account.pw_uid),
+                "--regid",
+                str(account.pw_gid),
+                "--clear-groups",
+                "--inh-caps=-all",
+                "--ambient-caps=-all",
+                "--bounding-set=-all",
+                "--no-new-privs",
+                "/usr/bin/env",
+                f"--chdir={work}",
+                "/bin/bash",
+                "--noprofile",
+                "--norc",
+                "-c",
+                "pwd; id -u; touch created-by-command",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
+        lines = completed.stdout.splitlines()
+        assert lines == [str(work), str(account.pw_uid)]
+        assert (work / "created-by-command").stat().st_uid == account.pw_uid
 
 
 def test_root_launcher_unshares_network_when_disabled(tmp_path: Path) -> None:
