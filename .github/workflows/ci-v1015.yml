@@ -45,7 +45,7 @@ jobs:
       - name: Run real Ubuntu and Bubblewrap validation
         run: |
           PYTHON_BIN="$(command -v python)"
-          sudo --preserve-env=PATH "$PYTHON_BIN" ci_v1015_validation.py
+          sudo "$PYTHON_BIN" ci_v1015_validation.py
 
   mark-success:
     name: Record validation success
