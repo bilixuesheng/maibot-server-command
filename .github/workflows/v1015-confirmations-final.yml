@@ -1,0 +1,103 @@
+name: Temporary v1.0.15 release gate
+
+on:
+  push:
+    branches:
+      - ci/v1.0.15-confirmations-final-20260729
+    paths-ignore:
+      - ci-v1015-result-2.3.0.json
+      - ci-v1015-result-latest.json
+      - ci-v1015-success.json
+      - ci-v1015-2.3.0.log
+      - ci-v1015-latest.log
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    name: SDK ${{ matrix.sdk }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk:
+          - "2.3.0"
+          - "latest"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ci/v1.0.15-confirmations-final-20260729
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run validation and record diagnostics
+        id: release-gate
+        shell: bash
+        run: |
+          set +e
+          LOG_FILE="ci-v1015-${{ matrix.sdk }}.log"
+          RESULT_FILE="ci-v1015-result-${{ matrix.sdk }}.json"
+          (
+            set -e
+            echo "stage=apt"
+            sudo apt-get update
+            sudo apt-get install -y bubblewrap openssl openssh-client
+            echo "stage=pip"
+            python -m pip install --upgrade pip
+            if [ "${{ matrix.sdk }}" = "latest" ]; then
+              python -m pip install -r requirements.txt
+            else
+              python -m pip install "maibot-plugin-sdk==${{ matrix.sdk }}"
+            fi
+            python -m pip install "ruff==0.12.7"
+            echo "stage=compile-lint"
+            python -m py_compile executor.py file_upload.py plugin.py temp_cleanup.py ci_v1015_validation.py
+            ruff check executor.py file_upload.py plugin.py temp_cleanup.py ci_v1015_validation.py
+            echo "stage=ubuntu-bubblewrap"
+            PYTHON_BIN="$(command -v python)"
+            sudo "$PYTHON_BIN" ci_v1015_validation.py
+          ) >"$LOG_FILE" 2>&1
+          STATUS=$?
+          if [ "$STATUS" -eq 0 ]; then
+            RESULT="passed"
+          else
+            RESULT="failed"
+          fi
+          printf '{"version":"1.0.15","ubuntu":"24.04","sdk":"%s","status":"%s","exit_code":%d}\n' \
+            "${{ matrix.sdk }}" "$RESULT" "$STATUS" >"$RESULT_FILE"
+          tail -n 160 "$LOG_FILE"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          for ATTEMPT in 1 2 3 4 5; do
+            git pull --rebase origin ci/v1.0.15-confirmations-final-20260729
+            git add "$RESULT_FILE" "$LOG_FILE"
+            git commit -m "ci: record v1.0.15 SDK ${{ matrix.sdk }} result" || true
+            if git push origin HEAD:ci/v1.0.15-confirmations-final-20260729; then
+              exit 0
+            fi
+            git rebase --abort || true
+            sleep "$ATTEMPT"
+          done
+          exit 1
+
+  mark-success:
+    name: Record validation success
+    needs:
+      - validate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ci/v1.0.15-confirmations-final-20260729
+      - name: Require both SDK results and commit success marker
+        shell: bash
+        run: |
+          test "$(python -c 'import json; print(json.load(open("ci-v1015-result-2.3.0.json"))["status"])')" = passed
+          test "$(python -c 'import json; print(json.load(open("ci-v1015-result-latest.json"))["status"])')" = passed
+          printf '%s\n' '{"version":"1.0.15","ubuntu":"24.04","sdk":["2.3.0","latest"],"bubblewrap":true,"status":"passed"}' > ci-v1015-success.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add ci-v1015-success.json
+          git commit -m "ci: record v1.0.15 release gate success"
+          git push origin HEAD:ci/v1.0.15-confirmations-final-20260729
