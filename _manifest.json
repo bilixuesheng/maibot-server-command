@@ -30,7 +30,12 @@
       "background": "#F3F4F6"
     }
   },
-  "capabilities": [],
+  "capabilities": [
+    "send.custom",
+    "chat.get_all_streams",
+    "chat.get_group_streams",
+    "chat.get_private_streams"
+  ],
   "i18n": {
     "default_locale": "zh-CN",
     "supported_locales": [

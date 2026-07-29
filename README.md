@@ -158,6 +158,11 @@ MaiBot，但这只解决本插件命令的降权与隔离；其他插件仍会�
 只有用户明确要求把某个具体文件发送到 QQ 时，模型才可以调用；禁止主动上传、
 批量探测或把不确定是否安全的文件发出。
 
+Manifest 已按最小权限声明该工具实际使用的 `send.custom`、
+`chat.get_all_streams`、`chat.get_group_streams` 和
+`chat.get_private_streams` 四项 Host 能力；没有声明数据库、历史消息、主动任务或
+其他无关能力。
+
 目标类型：
 
 - `current`：当前 QQ 会话；如果运行时没有提供当前 `stream_id`，调用会失败。
