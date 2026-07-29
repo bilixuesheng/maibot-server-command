@@ -128,9 +128,22 @@ def test_manifest_and_components() -> None:
 
 def test_scanner_and_staging() -> None:
     assert file_upload.sensitive_content_reason((ROOT / "file_upload.py").read_bytes()) is None
-    old_zip = ROOT / "maibot-server-command-1.0.14.zip"
-    assert old_zip.is_file()
-    assert file_upload.sensitive_content_reason(old_zip.read_bytes()) is None
+    self_archive_data = io.BytesIO()
+    with zipfile.ZipFile(self_archive_data, "w", zipfile.ZIP_DEFLATED) as archive:
+        for release_path in (
+            ".gitignore",
+            "LICENSE",
+            "README.md",
+            "_manifest.json",
+            "assets/icon.png",
+            "executor.py",
+            "file_upload.py",
+            "plugin.py",
+            "requirements.txt",
+            "temp_cleanup.py",
+        ):
+            archive.write(ROOT / release_path, release_path)
+    assert file_upload.sensitive_content_reason(self_archive_data.getvalue()) is None
 
     with tempfile.TemporaryDirectory(prefix="v1015-file-") as temp_directory:
         root = Path(temp_directory)
