@@ -200,9 +200,7 @@ class DeclarationTests(unittest.TestCase):
             manifest["version"],
         )
         self.assertEqual(manifest["host_application"]["min_version"], "1.1.0")
-        self.assertEqual(manifest["host_application"]["max_version"], "1.1.2")
         self.assertEqual(manifest["sdk"]["min_version"], "2.3.0")
-        self.assertEqual(manifest["sdk"]["max_version"], "2.7.1")
 
         plugin = plugin_module.ServerCommandPlugin()
         components = {item["name"]: item for item in plugin.get_components()}

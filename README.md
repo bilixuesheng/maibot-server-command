@@ -1,6 +1,6 @@
 # 服务器命令执行
 
-这是一个面向 MaiBot 1.1.0～1.1.2 / `maibot-plugin-sdk` 2.3.0～2.7.1 的 Tool 插件。它向 Maisaka
+这是一个面向 MaiBot 1.x / `maibot-plugin-sdk` 2.x 的 Tool 插件。它向 Maisaka
 提供 `run_server_command` 和 `send_server_file_to_qq`：前者让 MaiBot 在低权限
 沙箱中运行 Ubuntu 命令并提供可选 ROOT 模式，后者把经过安全检查的服务器普通
 文件发送到指定 QQ 会话。
@@ -144,8 +144,8 @@ Bubblewrap 的挂载和进程隔离；命令不依赖用户命名空间或 UID �
 要求：
 
 - Ubuntu
-- MaiBot 1.1.0～1.1.2（1.1.2 为本版发布时的最新正式版本）
-- `maibot-plugin-sdk` 2.3.0～2.7.1（2.7.1 为本版发布时的最新正式版本）
+- MaiBot 1.1.0 或更高的 1.x 版本
+- `maibot-plugin-sdk` 2.3.0 或更高的 2.x 版本
 - Bubblewrap
 - util-linux（Ubuntu 默认自带，用于 `/usr/bin/setpriv`）
 - QQ 文件上传需要支持文件消息段的 NapCat Adapter；建议使用 1.3.2 或更高版本
