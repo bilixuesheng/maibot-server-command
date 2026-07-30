@@ -329,6 +329,9 @@ def cleanup_expired_tasks(
         processed_tasks = 0
         with os.scandir(root_fd) as iterator:
             for entry in iterator:
+                if not budget.consume():
+                    report.budget_exhausted = True
+                    break
                 if processed_tasks >= MAX_TASKS_PER_PASS:
                     report.budget_exhausted = True
                     break

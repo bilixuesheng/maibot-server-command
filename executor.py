@@ -537,6 +537,17 @@ async def _capture_stream(
             truncated[0] = True
 
 
+async def _stop_process_group(process: asyncio.subprocess.Process) -> None:
+    """Terminate one isolated process group and wait until it is reaped."""
+
+    if process.returncode is None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    await process.wait()
+
+
 def _set_child_subreaper() -> None:
     """Keep daemonized descendants attached to the dedicated root supervisor."""
 
@@ -867,11 +878,10 @@ async def run_command(
         await asyncio.wait_for(process.wait(), timeout=timeout)
     except TimeoutError:
         timed_out = True
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        await process.wait()
+        await _stop_process_group(process)
+    except asyncio.CancelledError:
+        await asyncio.shield(_stop_process_group(process))
+        raise
     finally:
         await asyncio.gather(*readers)
 
@@ -957,6 +967,9 @@ async def _run_root_command(
     except TimeoutError:
         timed_out = True
         await _stop_root_supervisor(process)
+    except asyncio.CancelledError:
+        await asyncio.shield(_stop_root_supervisor(process))
+        raise
     finally:
         await asyncio.gather(*readers)
 

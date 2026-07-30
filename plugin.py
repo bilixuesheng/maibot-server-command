@@ -2,7 +2,9 @@
 
 import asyncio
 import contextlib
+import hashlib
 import importlib.util
+import json
 import os
 import re
 import secrets
@@ -23,18 +25,45 @@ from maibot_sdk import (
 from maibot_sdk.types import ToolParameterInfo, ToolParamType
 
 
-def _load_sibling_executor() -> Any:
-    """Load executor.py without relying on the Runner's sys.path."""
+def _read_plugin_version() -> str:
+    """Read the single authoritative release version from the manifest."""
 
-    module_name = "_xuesheng_maibot_server_command_executor_v1_0_15"
+    manifest_path = Path(__file__).resolve().with_name("_manifest.json")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ImportError(f"无法读取插件 Manifest：{manifest_path}") from exc
+    version = manifest.get("version")
+    if not isinstance(version, str) or re.fullmatch(r"\d+\.\d+\.\d+", version) is None:
+        raise ImportError(f"插件 Manifest 包含无效版本号：{version!r}")
+    return version
+
+
+PLUGIN_VERSION = _read_plugin_version()
+
+
+def _load_sibling_module(file_name: str, module_key: str, error_label: str) -> Any:
+    """Load one sibling module under a content-addressed, reload-safe name."""
+
+    module_path = Path(__file__).resolve().with_name(file_name)
+    try:
+        digest = hashlib.sha256()
+        digest.update(os.fsencode(module_path))
+        digest.update(b"\0")
+        digest.update(module_path.read_bytes())
+    except OSError as exc:
+        raise ImportError(f"无法读取插件{error_label}：{module_path}") from exc
+    module_name = (
+        f"_xuesheng_maibot_server_command_{module_key}_"
+        f"{digest.hexdigest()[:16]}"
+    )
     loaded = sys.modules.get(module_name)
     if loaded is not None:
         return loaded
 
-    executor_path = Path(__file__).resolve().with_name("executor.py")
-    spec = importlib.util.spec_from_file_location(module_name, executor_path)
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
     if spec is None or spec.loader is None:
-        raise ImportError(f"无法加载插件执行器：{executor_path}")
+        raise ImportError(f"无法加载插件{error_label}：{module_path}")
 
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
@@ -44,52 +73,24 @@ def _load_sibling_executor() -> Any:
         sys.modules.pop(module_name, None)
         raise
     return module
+
+
+def _load_sibling_executor() -> Any:
+    """Load executor.py without relying on the Runner's sys.path."""
+
+    return _load_sibling_module("executor.py", "executor", "执行器")
 
 
 def _load_sibling_file_upload() -> Any:
     """Load file_upload.py without relying on the Runner's sys.path."""
 
-    module_name = "_xuesheng_maibot_server_command_file_upload_v1_0_15"
-    loaded = sys.modules.get(module_name)
-    if loaded is not None:
-        return loaded
-
-    upload_path = Path(__file__).resolve().with_name("file_upload.py")
-    spec = importlib.util.spec_from_file_location(module_name, upload_path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"无法加载插件文件上传模块：{upload_path}")
-
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop(module_name, None)
-        raise
-    return module
+    return _load_sibling_module("file_upload.py", "file_upload", "文件上传模块")
 
 
 def _load_sibling_temp_cleanup() -> Any:
     """Load temp_cleanup.py without relying on the Runner's sys.path."""
 
-    module_name = "_xuesheng_maibot_server_command_temp_cleanup_v1_0_15"
-    loaded = sys.modules.get(module_name)
-    if loaded is not None:
-        return loaded
-
-    cleanup_path = Path(__file__).resolve().with_name("temp_cleanup.py")
-    spec = importlib.util.spec_from_file_location(module_name, cleanup_path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"无法加载插件临时文件清理模块：{cleanup_path}")
-
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop(module_name, None)
-        raise
-    return module
+    return _load_sibling_module("temp_cleanup.py", "temp_cleanup", "临时文件清理模块")
 
 
 _executor = _load_sibling_executor()
@@ -131,6 +132,11 @@ _TRUSTED_ACTION_NAMES = frozenset(
     {
         "run_trusted_private_server_command",
         "send_trusted_private_server_file",
+    }
+)
+_HOST_CONTEXT_BOUND_TOOL_NAMES = frozenset(
+    {
+        "send_server_file_to_qq",
     }
 )
 
@@ -307,6 +313,8 @@ class FileUploadConfig(PluginConfigBase):
             "label": "本地路径单文件上限（MiB）",
             "hint": (
                 "仅在开启 NapCat 本地路径发送时生效；插件硬上限为 1024 MiB。"
+                "ZIP 及可读嵌套 ZIP 的共享解压扫描预算也会随此上限提高，"
+                "但最低为 32 MiB；"
                 "QQ 或 NapCat 仍可能有更低的平台限制。"
             ),
             "x-widget": "number",
@@ -640,7 +648,7 @@ class PluginMetadataConfig(PluginConfigBase):
     __ui_order__ = -1
 
     config_version: str = Field(
-        default="1.0.15",
+        default=PLUGIN_VERSION,
         description="配置结构版本",
         json_schema_extra={
             "label": "配置版本",
@@ -706,6 +714,8 @@ class ServerCommandPlugin(MaiBotPlugin):
             if component.get("name") in _TRUSTED_ACTION_NAMES:
                 component["chat_scope"] = "private"
                 metadata["chat_scope"] = "private"
+            if component.get("name") in _HOST_CONTEXT_BOUND_TOOL_NAMES:
+                metadata["invoke_method"] = "plugin.invoke_action"
         return components
 
     def _root_mode_state(self) -> tuple[bool, str]:
@@ -1735,21 +1745,9 @@ class ServerCommandPlugin(MaiBotPlugin):
                 "并且 target_id、target_type 和 account_id 必须完全匹配。"
             )
         if len(matches) > 1:
-            candidate_accounts = sorted(
-                {
-                    self._stream_account_id(stream)
-                    for stream in matches
-                    if self._stream_account_id(stream)
-                }
-            )
-            suffix = (
-                f" 可选 account_id：{', '.join(candidate_accounts)}。"
-                if candidate_accounts
-                else ""
-            )
             raise FileUploadError(
-                "有多个 QQ 机器人账号匹配该目标，拒绝猜测；请填写 account_id。"
-                f"{suffix}"
+                "有多个 QQ 机器人账号匹配该目标，拒绝猜测；"
+                "请由管理员确认并填写 account_id。"
             )
 
         stream = matches[0]
@@ -1980,9 +1978,13 @@ class ServerCommandPlugin(MaiBotPlugin):
             "中的普通文件；受限 ROOT 或完全 ROOT 生效后可读取全系统普通文件。"
             "此普通文件工具始终禁止上传密码、Token、私钥、Cookie、认证配置、"
             "数据库、备份、个人信息或其他敏感数据，也不得通过改名、复制、压缩、"
-            "编码等方式绕过；不确定文件是否敏感时必须拒绝调用。内置路径和内容扫描"
-            "只是额外防线，扫描未命中不代表文件安全。符号链接、硬链接、目录、FIFO、"
-            "Socket、设备、空文件、读取中发生变化的文件和超过大小上限的文件都会被拒绝。"
+            "加密或编码故意外传；加密或不透明格式不会仅因格式被拒绝，但插件无法"
+            "检查其明文，来源或用途不确定时必须拒绝调用。内置路径和内容扫描只是"
+            "额外防线，扫描未命中不代表文件安全。唯一例外是 Host 绑定的真实"
+            "调用来源与解析后的发送目标为当前同一个白名单 QQ 私聊，此时插件自动"
+            "切换到管理员明确启用的可信上传路径；所有群聊始终执行普通扫描。"
+            "符号链接、硬链接、目录、FIFO、Socket、设备、空文件、读取中发生变化"
+            "的文件和超过大小上限的文件都会被拒绝。"
             "若文件来自 $MAIBOT_TEMP_DIR，且 QQ 明确返回发送成功、文件身份未变化、"
             "任务也已结束，插件会按管理员配置立即删除该临时源文件；普通 /work、"
             "/root、/etc 等路径永不因此自动删除。发送失败或结果不确定时必须保留，"
@@ -2089,18 +2091,72 @@ class ServerCommandPlugin(MaiBotPlugin):
                 "upload_id": audit_id,
             }
 
+        same_current_stream = bool(
+            current_stream_id and stream_id == current_stream_id
+        )
+        trusted_identity_matched = False
+        if same_current_stream:
+            try:
+                trusted_identity_matched, trusted_reason = (
+                    await self._trusted_private_caller(current_stream_id)
+                )
+            except Exception as exc:
+                trusted_reason = "QQ 私聊身份反查异常"
+                self.ctx.logger.error(
+                    "普通上传的可信私聊身份反查异常："
+                    "upload_id=%s error_type=%s",
+                    audit_id,
+                    type(exc).__name__,
+                )
+            if trusted_identity_matched and os.geteuid() != 0:
+                self.ctx.logger.critical(
+                    "普通上传已命中可信 QQ 私聊但无法绕过："
+                    "upload_id=%s reason=maibot_not_root",
+                    audit_id,
+                )
+                return {
+                    "success": False,
+                    "name": "send_server_file_to_qq",
+                    "content": (
+                        "当前真实 QQ 私聊已命中白名单，但 MaiBot 不是由 root 用户运行；"
+                        "为避免静默降级，文件未读取也未发送。"
+                    ),
+                    "upload_id": audit_id,
+                    "execution_mode": "trusted_private_unavailable",
+                    "trusted_private_bypass": False,
+                    "sensitive_file_guard": "enabled",
+                }
+            if not trusted_identity_matched and self.config.trusted_private_bypass.enabled:
+                self.ctx.logger.info(
+                    "普通上传未命中可信私聊绕过：upload_id=%s reason=%s",
+                    audit_id,
+                    trusted_reason,
+                )
+
         configured_root_active, root_reason = self._root_mode_state()
         unrestricted_active, unrestricted_reason = self._unrestricted_root_state(
             configured_root_active
         )
-        root_active = configured_root_active
-        sensitive_guard_enabled = True
-        sensitive_guard_state = "enabled"
-        if unrestricted_active:
+        if trusted_identity_matched:
+            root_active = True
+            sensitive_guard_enabled = False
+            sensitive_guard_state = "disabled_by_trusted_private"
+            trusted_file_bypass = True
+            execution_mode = "trusted_private_unrestricted"
+        elif unrestricted_active:
+            root_active = configured_root_active
+            sensitive_guard_enabled = True
+            sensitive_guard_state = "enabled"
             execution_mode = "root_unrestricted"
         elif configured_root_active:
+            root_active = configured_root_active
+            sensitive_guard_enabled = True
+            sensitive_guard_state = "enabled"
             execution_mode = "root_restricted"
         else:
+            root_active = False
+            sensitive_guard_enabled = True
+            sensitive_guard_state = "enabled"
             execution_mode = "sandbox"
             if self.config.root_mode.enabled:
                 self.ctx.logger.warning(
@@ -2261,7 +2317,13 @@ class ServerCommandPlugin(MaiBotPlugin):
             )
         else:
             cleanup_notice = "源文件不属于受管临时目录，插件没有删除它。"
-        guard_notice = "敏感文件禁令仍然有效；内置扫描通过不代表可忽略人工判断。"
+        if trusted_file_bypass:
+            guard_notice = (
+                "调用来源与目标均为当前同一个白名单私聊，"
+                "本次敏感路径、文件名和内容扫描已按管理员配置关闭。"
+            )
+        else:
+            guard_notice = "敏感文件禁令仍然有效；内置扫描通过不代表可忽略人工判断。"
         return {
             "success": True,
             "name": "send_server_file_to_qq",

@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "xuesheng.maibot-server-command",
-  "version": "1.0.15",
+  "version": "1.0.19",
   "name": "服务器命令执行",
   "description": "让 MaiBot 运行受控服务器命令、发送服务器文件并安全清理临时副本",
   "author": {
@@ -14,11 +14,11 @@
   },
   "host_application": {
     "min_version": "1.1.0",
-    "max_version": "1.99.99"
+    "max_version": "1.1.2"
   },
   "sdk": {
     "min_version": "2.3.0",
-    "max_version": "2.99.99"
+    "max_version": "2.7.1"
   },
   "dependencies": [],
   "plugin_type": "tool",

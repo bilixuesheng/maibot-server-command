@@ -1,0 +1,64 @@
+name: Stability checks
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: SDK ${{ matrix.sdk }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk:
+          - "2.3.0"
+          - "latest"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Ubuntu dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes bubblewrap util-linux
+
+      - name: Install Python dependencies
+        shell: bash
+        run: |
+          python -m pip install --disable-pip-version-check --upgrade pip
+          if [ "${{ matrix.sdk }}" = "latest" ]; then
+            python -m pip install -r requirements.txt
+          else
+            python -m pip install "maibot-plugin-sdk==${{ matrix.sdk }}"
+          fi
+          python -m pip install "ruff==0.12.7"
+
+      - name: Compile and lint
+        run: |
+          python -m py_compile executor.py file_upload.py plugin.py temp_cleanup.py
+          python -m py_compile tests/test_stability.py
+          ruff check executor.py file_upload.py plugin.py temp_cleanup.py tests
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Run real Bubblewrap and ROOT integration
+        shell: bash
+        run: |
+          PYTHON_BIN="$(command -v python)"
+          sudo env MAIBOT_INTEGRATION=1 "$PYTHON_BIN" \
+            -m unittest tests.test_stability.RealUbuntuIntegrationTests -v
