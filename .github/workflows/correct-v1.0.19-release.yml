@@ -1,0 +1,194 @@
+name: Correct and verify v1.0.19 release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/correct-v1.0.19-release.yml
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out the confirmed product commit
+        uses: actions/checkout@v4
+        with:
+          ref: 00bdddfff3fdf7792ea218e34c076af91a02afeb
+          fetch-depth: 0
+
+      - name: Verify project files were left unchanged
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          manifest = json.loads(
+              Path("_manifest.json").read_text(encoding="utf-8")
+          )
+          assert manifest["version"] == "1.0.19"
+          assert manifest["host_application"] == {
+              "min_version": "1.1.0",
+              "max_version": "1.99.99",
+          }
+          assert manifest["sdk"] == {
+              "min_version": "2.3.0",
+              "max_version": "2.99.99",
+          }
+          PY
+
+      - name: Rebuild and verify the confirmed release archive
+        shell: bash
+        run: |
+          mkdir -p release/maibot-server-command/assets
+          cp .gitignore LICENSE README.md _manifest.json executor.py file_upload.py plugin.py requirements.txt temp_cleanup.py release/maibot-server-command/
+          cp assets/icon.png release/maibot-server-command/assets/icon.png
+          TZ=Asia/Taipei touch -t 202607300936.35 release/maibot-server-command/.gitignore
+          TZ=Asia/Taipei touch -t 202607301911.53 \
+            release/maibot-server-command/LICENSE \
+            release/maibot-server-command/executor.py \
+            release/maibot-server-command/requirements.txt \
+            release/maibot-server-command/temp_cleanup.py \
+            release/maibot-server-command/assets/icon.png
+          TZ=Asia/Taipei touch -t 202607301923.11 release/maibot-server-command/README.md
+          TZ=Asia/Taipei touch -t 202607301915.26 release/maibot-server-command/_manifest.json
+          TZ=Asia/Taipei touch -t 202607301925.58 release/maibot-server-command/file_upload.py
+          TZ=Asia/Taipei touch -t 202607301923.26 release/maibot-server-command/plugin.py
+          (
+            cd release
+            TZ=Asia/Taipei zip -X -q maibot-server-command-v1.0.19.zip \
+              maibot-server-command/.gitignore \
+              maibot-server-command/LICENSE \
+              maibot-server-command/README.md \
+              maibot-server-command/_manifest.json \
+              maibot-server-command/assets/icon.png \
+              maibot-server-command/executor.py \
+              maibot-server-command/file_upload.py \
+              maibot-server-command/plugin.py \
+              maibot-server-command/requirements.txt \
+              maibot-server-command/temp_cleanup.py
+          )
+          echo "6b1a1a48b4cdcef3ab6aad210965ea8a1830204f1a531e504619bf2c01ced49f  release/maibot-server-command-v1.0.19.zip" | sha256sum --check --strict
+          test "$(unzip -Z1 release/maibot-server-command-v1.0.19.zip | wc -l)" -eq 10
+          ! unzip -Z1 release/maibot-server-command-v1.0.19.zip | grep -Eq '(^|/)(config\.toml|ci_|__pycache__|.*\.pyc$|\.github/|tests?/|.*\.patch$)'
+
+      - name: Write corrected release notes
+        shell: bash
+        run: |
+          cat > release-notes.md <<'RELEASE_NOTES'
+          ## 支持版本
+
+          - MaiBot：1.1.0 ～ 1.1.2
+          - **MaiBot 1.1.2 是本插件发布时的最新正式版本。**
+          - maibot-plugin-sdk：2.3.0 ～ 2.7.1
+          - 本次发布只更新插件，不修改 MaiBot 主程序。
+
+          ## 更新日志
+
+          ### 修复正常 APK 误报
+
+          - 修复正常 APK 因内含 Gzip、JAR、SQLite、公开 CA 证书、二进制符号或文件名中的 `token` 字样而被误报为敏感文件。
+          - 不按 `.apk` 后缀放行；所有群聊仍执行完整的可见内容、路径和容器结构扫描。
+          - 可读取 ZIP 与小型嵌套 ZIP 会在共享条目、字节、深度和数量预算内继续扫描。
+          - ZIP 目录穿越、符号链接、FIFO/设备等特殊成员、CRC/读取错误、声明大小异常和解压预算超限仍会拒绝。
+
+          ### 允许正常加密与不透明载荷
+
+          - ZIP 加密成员、未知 ZIP 压缩方法、Gzip、7z、RAR、Bzip2、XZ、age 与 OpenSSL `Salted__` 不再仅因格式本身被拒绝。
+          - 加密成员的可见路径仍会检查，明确指向 `.ssh/id_rsa`、凭据目录等高风险位置时仍拒绝。
+          - 插件无法检查加密或不支持格式的明文；允许这些格式不代表其内部内容已被证明安全。
+
+          ### 稳定性与权限边界
+
+          - 白名单只在真实 QQ 私聊发起并发回同一私聊时生效；所有群聊始终开启敏感扫描。
+          - 保留 1.0.16 的稳定性修复：Host 取消时回收命令进程、临时目录共享预算、本地路径大 ZIP 扫描预算、内容寻址模块缓存，以及普通上传入口自动复核可信私聊。
+          - 普通 Token/JWT、完整私钥、真实认证头、Cookie、凭据赋值和 URL 密码仍会拒绝；代码占位符、运行时取值表达式和随机二进制片段不再作为凭据本身。
+          - 发布包不包含 Host 文件、主程序补丁、测试文件或 CI 文件。
+
+          ## 验证记录
+
+          - SDK 2.3.0 与发布时最新 SDK 2.7.1 均通过 27 项回归：25 项通过，2 项因本地沙箱环境跳过。
+          - GitHub Ubuntu 24.04 门禁已通过编译、Ruff、双 SDK 单元与安全回归，以及真实 Bubblewrap、UID 0 降权和 ROOT 监督器集成测试。
+          - 官方 APK 在群聊扫描开启状态下实跑通过：70,922,619 字节，源文件与 NapCat 只读暂存副本 SHA-256 一致，身份复核及精确删除通过。
+          - 系统 `zip -P` 生成的真实加密 ZIP，以及 ZIP64、数据描述符、重复成员、未知方法、Windows/Unicode 路径均已覆盖。
+          - 正式 ZIP 只有一个 `maibot-server-command/` 顶层目录和 10 个运行文件，内容与发布源码逐字节一致。
+
+          ## 文件校验
+
+          `maibot-server-command-v1.0.19.zip`
+
+          SHA-256：`6b1a1a48b4cdcef3ab6aad210965ea8a1830204f1a531e504619bf2c01ced49f`
+          RELEASE_NOTES
+
+      - name: Remove the superseded release and tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          test "$(gh api "repos/${GITHUB_REPOSITORY}/commits/v1.0.19" --jq '.sha')" = "5578692bd4b892eada679199178f5e2a3ccbd175"
+          gh release delete v1.0.19 \
+            --repo "${GITHUB_REPOSITORY}" \
+            --cleanup-tag \
+            --yes
+          if gh release view v1.0.19 --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Superseded release still exists." >&2
+            exit 1
+          fi
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/v1.0.19" >/dev/null 2>&1; then
+            echo "Superseded tag still exists." >&2
+            exit 1
+          fi
+
+      - name: Create the corrected GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create v1.0.19 \
+            release/maibot-server-command-v1.0.19.zip \
+            --repo "${GITHUB_REPOSITORY}" \
+            --target 00bdddfff3fdf7792ea218e34c076af91a02afeb \
+            --title "服务器命令执行 v1.0.19" \
+            --notes-file release-notes.md \
+            --latest
+
+      - name: Verify the corrected tag, notes, and asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/v1.0.19")"
+          jq -e '
+            .tag_name == "v1.0.19" and
+            .name == "服务器命令执行 v1.0.19" and
+            .draft == false and
+            .prerelease == false and
+            ([.assets[] | select(.name == "maibot-server-command-v1.0.19.zip")] | length == 1) and
+            (.assets | length == 1)
+          ' <<<"${release_json}" >/dev/null
+          body="$(jq -r '.body' <<<"${release_json}")"
+          grep -Fq "MaiBot 1.1.2 是本插件发布时的最新正式版本" <<<"${body}"
+          grep -Fq "6b1a1a48b4cdcef3ab6aad210965ea8a1830204f1a531e504619bf2c01ced49f" <<<"${body}"
+          test "$(gh api "repos/${GITHUB_REPOSITORY}/commits/v1.0.19" --jq '.sha')" = "00bdddfff3fdf7792ea218e34c076af91a02afeb"
+          mkdir -p release-verification
+          gh release download v1.0.19 \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern "maibot-server-command-v1.0.19.zip" \
+            --dir release-verification
+          echo "6b1a1a48b4cdcef3ab6aad210965ea8a1830204f1a531e504619bf2c01ced49f  release-verification/maibot-server-command-v1.0.19.zip" | sha256sum --check --strict
+
+      - name: Remove this correction workflow
+        shell: bash
+        run: |
+          git fetch origin main
+          git checkout -B main origin/main
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/correct-v1.0.19-release.yml
+          git commit -m "chore: remove v1.0.19 release correction workflow (release verified)"
+          git push origin HEAD:main
