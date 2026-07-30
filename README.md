@@ -1,4 +1,4 @@
-# 服务器命令执行
+# 麦麦操作服务器与发送文件
 
 这是一个面向 MaiBot 1.x / `maibot-plugin-sdk` 2.x 的 Tool 插件。它向 Maisaka
 提供 `run_server_command` 和 `send_server_file_to_qq`：前者让 MaiBot 在低权限
