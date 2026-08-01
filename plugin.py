@@ -40,6 +40,11 @@ def _read_plugin_version() -> str:
 
 
 PLUGIN_VERSION = _read_plugin_version()
+# MaiBot currently requires every component RPC to declare a finite deadline;
+# zero falls back to the Host's short default. Sandbox commands still stop at
+# their configured 1–300 second limit, while ROOT commands use this transport
+# ceiling only so the Host does not reintroduce the sandbox command timeout.
+COMMAND_RPC_TIMEOUT_MS = 31_536_000_000
 
 
 def _load_sibling_module(file_name: str, module_key: str, error_label: str) -> Any:
@@ -149,8 +154,9 @@ ROOT_MODE_NOTICE = (
     "不能把“未被拦截”视为命令安全。\n"
     "ROOT 文件上传可以读取全系统普通文件，但敏感文件始终禁止上传；"
     "不得通过改名、压缩、编码或复制到其他目录绕过。\n"
-    "ROOT 不受“最大进程数”配置约束；命令结束或超时后，插件会清理本次命令"
-    "直接产生的后台后代进程。"
+    "沙箱配置的运行时间、虚拟内存、单文件大小、文件描述符和进程数上限均不应用"
+    "于 ROOT；只会截断返回给麦麦的过长输出，不会因此终止命令。\n"
+    "命令结束或工具调用被取消后，插件会清理本次命令直接产生的后台后代进程。"
 )
 
 UNRESTRICTED_ROOT_NOTICE = (
@@ -160,15 +166,17 @@ UNRESTRICTED_ROOT_NOTICE = (
     "提权维持、凭据读取或泄露数据的命令；不确定是否安全时不要执行。\n"
     "完全 ROOT 只关闭命令正则拦截，不会关闭文件上传的敏感信息防护；"
     "不得上传、改名、打包或编码任何敏感数据。\n"
-    "ROOT 不受“最大进程数”配置约束；命令结束或超时后，插件会清理本次命令"
-    "直接产生的后台后代进程。"
+    "沙箱配置的运行时间、虚拟内存、单文件大小、文件描述符和进程数上限均不应用"
+    "于 ROOT；只会截断返回给麦麦的过长输出，不会因此终止命令。\n"
+    "命令结束或工具调用被取消后，插件会清理本次命令直接产生的后台后代进程。"
 )
 
 TRUSTED_PRIVATE_NOTICE = (
     "☢️ 当前权限模式：可信 QQ 私聊完全绕过（工作目录为 /root）。\n"
     "当前 Action 的真实 MaiBot 聊天流已反查为管理员白名单内的 QQ 私聊。"
     "插件不会应用 Bubblewrap 沙箱、ROOT 确认项或高风险命令正则；"
-    "命令以 MaiBot 的 root 身份直接执行。超时、输出和资源上限仍然保留。\n"
+    "命令以 MaiBot 的 root 身份直接执行，不应用沙箱的运行时间、虚拟内存、"
+    "单文件大小、文件描述符或进程数限制；只截断返回给麦麦的过长输出。\n"
     "向当前同一私聊发送文件时，敏感路径、文件名与内容扫描也会关闭；"
     "文件类型、符号链接、硬链接、读取竞态和大小上限仍然检查。"
 )
@@ -204,10 +212,13 @@ class CommandSandboxConfig(PluginConfigBase):
     )
     timeout_seconds: int = Field(
         default=20,
-        description="单条命令最长运行时间（1–300 秒）",
+        description="低权限沙箱单条命令最长运行时间（1–300 秒）",
         json_schema_extra={
-            "label": "命令超时时间（秒）",
-            "hint": "单条命令最多运行多久；有效范围为 1–300 秒。",
+            "label": "沙箱命令超时时间（秒）",
+            "hint": (
+                "仅限制低权限 Bubblewrap 沙箱命令；受限 ROOT、完全 ROOT 和可信私聊"
+                " ROOT 绕过不应用此项。有效范围为 1–300 秒。"
+            ),
             "x-widget": "number",
             "step": 1,
         },
@@ -224,20 +235,26 @@ class CommandSandboxConfig(PluginConfigBase):
     )
     memory_limit_mb: int = Field(
         default=256,
-        description="每个进程的最大虚拟内存（MB）",
+        description="低权限沙箱每个进程的最大虚拟内存（MB）",
         json_schema_extra={
-            "label": "内存上限（MB）",
-            "hint": "每个命令进程可使用的最大虚拟内存；有效范围为 64–2048 MB。",
+            "label": "沙箱内存上限（MB）",
+            "hint": (
+                "仅限制低权限 Bubblewrap 沙箱；ROOT 命令不应用此项。"
+                "有效范围为 64–2048 MB。"
+            ),
             "x-widget": "number",
             "step": 64,
         },
     )
     file_size_limit_mb: int = Field(
         default=64,
-        description="单个文件的最大大小（MB）",
+        description="低权限沙箱命令创建的单个文件最大大小（MB）",
         json_schema_extra={
-            "label": "单文件大小上限（MB）",
-            "hint": "命令创建的单个文件最大大小；有效范围为 1–1024 MB。",
+            "label": "沙箱单文件大小上限（MB）",
+            "hint": (
+                "仅限制低权限 Bubblewrap 沙箱；ROOT 命令不应用此项。"
+                "有效范围为 1–1024 MB。"
+            ),
             "x-widget": "number",
             "step": 1,
         },
@@ -249,7 +266,7 @@ class CommandSandboxConfig(PluginConfigBase):
             "label": "低权限沙箱最大进程数",
             "hint": (
                 "仅限制低权限沙箱命令及其子进程；有效范围为 8–128。"
-                "Linux 不对 UID 0 执行 RLIMIT_NPROC，因此两种 ROOT 模式不应用此项。"
+                "所有 ROOT 执行模式均不应用此项。"
             ),
             "x-widget": "number",
             "step": 1,
@@ -778,8 +795,9 @@ class ServerCommandPlugin(MaiBotPlugin):
         payload["execution_mode"] = "root_restricted"
         payload["command_regex_guard"] = "enabled"
         payload["working_directory"] = "/root"
-        payload["process_limit"] = "not_enforced_for_uid_0"
-        payload["descendant_cleanup"] = "on_command_exit_or_timeout"
+        payload["sandbox_resource_limits"] = "disabled_for_root"
+        payload["output_capture_limit"] = "enabled"
+        payload["descendant_cleanup"] = "on_command_exit_or_cancellation"
         return payload
 
     @staticmethod
@@ -789,8 +807,9 @@ class ServerCommandPlugin(MaiBotPlugin):
         payload["execution_mode"] = "root_unrestricted"
         payload["command_regex_guard"] = "disabled"
         payload["working_directory"] = "/root"
-        payload["process_limit"] = "not_enforced_for_uid_0"
-        payload["descendant_cleanup"] = "on_command_exit_or_timeout"
+        payload["sandbox_resource_limits"] = "disabled_for_root"
+        payload["output_capture_limit"] = "enabled"
+        payload["descendant_cleanup"] = "on_command_exit_or_cancellation"
         return payload
 
     @staticmethod
@@ -800,8 +819,9 @@ class ServerCommandPlugin(MaiBotPlugin):
         payload["execution_mode"] = "trusted_private_unrestricted"
         payload["command_regex_guard"] = "disabled_by_trusted_private"
         payload["working_directory"] = "/root"
-        payload["process_limit"] = "not_enforced_for_uid_0"
-        payload["descendant_cleanup"] = "on_command_exit_or_timeout"
+        payload["sandbox_resource_limits"] = "disabled_for_root"
+        payload["output_capture_limit"] = "enabled"
+        payload["descendant_cleanup"] = "on_command_exit_or_cancellation"
         payload["trusted_private_bypass"] = True
         return payload
 
@@ -1367,7 +1387,7 @@ class ServerCommandPlugin(MaiBotPlugin):
             self._sandbox_error = ""
             self.ctx.logger.critical(
                 "完全 ROOT 模式已启用：sandbox=disabled cwd=/root regex_guard=disabled；"
-                "命令不会经过高风险正则拦截"
+                "sandbox_resource_limits=disabled；命令不会经过高风险正则拦截"
             )
             return
         if self.config.unrestricted_root.enabled:
@@ -1379,7 +1399,7 @@ class ServerCommandPlugin(MaiBotPlugin):
             self._sandbox_error = ""
             self.ctx.logger.critical(
                 "受限 ROOT 模式已启用：沙箱已关闭，命令将以 root 在 /root 执行；"
-                "插件会拒绝识别到的高风险命令"
+                "sandbox_resource_limits=disabled；插件会拒绝识别到的高风险命令"
             )
             return
         if self.config.root_mode.enabled:
@@ -1453,7 +1473,8 @@ class ServerCommandPlugin(MaiBotPlugin):
             if unrestricted_active:
                 self.ctx.logger.critical(
                     "配置更新后完全 ROOT 已启用：version=%s cwd=/root "
-                    "sandbox=disabled regex_guard=disabled",
+                    "sandbox=disabled regex_guard=disabled "
+                    "sandbox_resource_limits=disabled",
                     version,
                 )
             elif root_active:
@@ -1464,7 +1485,8 @@ class ServerCommandPlugin(MaiBotPlugin):
                     )
                 self.ctx.logger.critical(
                     "配置更新后受限 ROOT 已启用：version=%s cwd=/root "
-                    "sandbox=disabled regex_guard=enabled",
+                    "sandbox=disabled regex_guard=enabled "
+                    "sandbox_resource_limits=disabled",
                     version,
                 )
             else:
@@ -1577,16 +1599,6 @@ class ServerCommandPlugin(MaiBotPlugin):
         if normalized in {"1", "true", "yes", "on"}:
             return True
         raise ValueError(f"{name} 必须是 true 或 false。")
-
-    @staticmethod
-    def _action_timeout(kwargs: dict[str, Any]) -> int:
-        raw_value = kwargs.get("timeout_seconds", 20)
-        if raw_value in (None, ""):
-            return 20
-        try:
-            return int(raw_value)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("timeout_seconds 必须是整数。") from exc
 
     async def _authorize_trusted_action(
         self,
@@ -2351,12 +2363,11 @@ class ServerCommandPlugin(MaiBotPlugin):
         description=(
             "仅供管理员配置的可信 QQ 私聊使用：以 MaiBot 的 root 身份在 /root "
             "直接执行 Bash 命令。Host 会强制绑定真实私聊会话；此能力不应用 "
-            "Bubblewrap 沙箱、ROOT 确认项或高风险命令正则，但仍应用超时、输出、"
-            "内存、文件大小限制和命令结束后的后代进程清理。"
+            "Bubblewrap 沙箱、ROOT 确认项、高风险命令正则或沙箱资源限制。"
+            "过长输出只会在返回给麦麦时截断；命令结束或调用取消时清理后代进程。"
         ),
         action_parameters={
             "command": "要以 root 在 /root 直接执行的 Ubuntu Bash 命令",
-            "timeout_seconds": "本次超时秒数；不得超过插件配置上限，默认 20",
             "temp_task_id": "可选的受管临时任务 ID；只能复用先前返回的真实 ID",
             "start_new_temp_task": "是否明确新建受管临时任务；true 或 false",
         },
@@ -2366,7 +2377,7 @@ class ServerCommandPlugin(MaiBotPlugin):
             "高风险、破坏性、凭据读取、持久化提权或数据外传仍应由模型拒绝",
         ],
         chat_scope="private",
-        timeout_ms=330_000,
+        timeout_ms=COMMAND_RPC_TIMEOUT_MS,
     )
     async def handle_run_trusted_private_server_command(
         self,
@@ -2411,7 +2422,6 @@ class ServerCommandPlugin(MaiBotPlugin):
             }
 
         try:
-            timeout_seconds = self._action_timeout(kwargs)
             start_new_temp_task = self._action_bool(
                 kwargs,
                 "start_new_temp_task",
@@ -2431,13 +2441,6 @@ class ServerCommandPlugin(MaiBotPlugin):
             kwargs.get("message"),
         )
         settings = self.config.sandbox
-        limits = SandboxLimits(
-            timeout_seconds=settings.timeout_seconds,
-            max_output_bytes=settings.max_output_bytes,
-            memory_limit_mb=settings.memory_limit_mb,
-            file_size_limit_mb=settings.file_size_limit_mb,
-            max_processes=settings.max_processes,
-        )
         try:
             temp_task = await self._create_command_temp(
                 root_active=True,
@@ -2468,31 +2471,20 @@ class ServerCommandPlugin(MaiBotPlugin):
         try:
             self.ctx.logger.critical(
                 "麦麦准备执行可信私聊完全绕过命令："
-                "command_id=%s cwd=/root regex_guard=disabled timeout=%ss",
+                "command_id=%s cwd=/root regex_guard=disabled "
+                "sandbox_resource_limits=disabled",
                 audit_id,
-                min(
-                    max(1, timeout_seconds),
-                    limits.normalized().timeout_seconds,
-                ),
             )
             result = await run_unrestricted_root_command(
                 command,
-                limits,
-                requested_timeout=timeout_seconds,
+                max_output_bytes=settings.max_output_bytes,
                 managed_temp_directory=(
                     os.fspath(temp_task.host_path)
                     if temp_task is not None
                     else None
                 ),
             )
-            if result.timed_out:
-                self.ctx.logger.warning(
-                    "可信私聊完全绕过命令超时："
-                    "command_id=%s exit_code=%s",
-                    audit_id,
-                    result.exit_code,
-                )
-            elif result.exit_code != 0:
+            if result.exit_code != 0:
                 self.ctx.logger.warning(
                     "可信私聊完全绕过命令失败："
                     "command_id=%s exit_code=%s",
@@ -2522,8 +2514,9 @@ class ServerCommandPlugin(MaiBotPlugin):
                 "execution_mode": "trusted_private_unrestricted",
                 "command_regex_guard": "disabled_by_trusted_private",
                 "working_directory": "/root",
-                "process_limit": "not_enforced_for_uid_0",
-                "descendant_cleanup": "on_command_exit_or_timeout",
+                "sandbox_resource_limits": "disabled_for_root",
+                "output_capture_limit": "enabled",
+                "descendant_cleanup": "on_command_exit_or_cancellation",
                 "trusted_private_bypass": True,
             }
         finally:
@@ -2565,7 +2558,10 @@ class ServerCommandPlugin(MaiBotPlugin):
             ToolParameterInfo(
                 name="timeout_seconds",
                 param_type=ToolParamType.INTEGER,
-                description="本次超时秒数；不得超过插件配置上限",
+                description=(
+                    "仅低权限沙箱使用的本次超时秒数；不得超过插件配置上限。"
+                    "受限 ROOT 和完全 ROOT 会忽略此参数"
+                ),
                 required=False,
                 default=20,
             ),
@@ -2590,7 +2586,7 @@ class ServerCommandPlugin(MaiBotPlugin):
                 default=False,
             ),
         ],
-        timeout_ms=330_000,
+        timeout_ms=COMMAND_RPC_TIMEOUT_MS,
     )
     async def handle_run_server_command(
         self,
@@ -2617,13 +2613,6 @@ class ServerCommandPlugin(MaiBotPlugin):
         unrestricted_active, unrestricted_reason = self._unrestricted_root_state(root_active)
         settings = self.config.sandbox
         audit_id = command_audit_id(str(command))
-        limits = SandboxLimits(
-            timeout_seconds=settings.timeout_seconds,
-            max_output_bytes=settings.max_output_bytes,
-            memory_limit_mb=settings.memory_limit_mb,
-            file_size_limit_mb=settings.file_size_limit_mb,
-            max_processes=settings.max_processes,
-        )
         if unrestricted_active:
             execution_mode = "root_unrestricted"
             mode_label = "完全 ROOT"
@@ -2656,27 +2645,18 @@ class ServerCommandPlugin(MaiBotPlugin):
             try:
                 self.ctx.logger.critical(
                     "麦麦准备执行%s命令：command_id=%s cwd=/root "
-                    "regex_guard=disabled timeout=%ss",
+                    "regex_guard=disabled sandbox_resource_limits=disabled",
                     mode_label,
                     audit_id,
-                    min(max(1, int(timeout_seconds)), limits.normalized().timeout_seconds),
                 )
                 result = await run_unrestricted_root_command(
                     str(command),
-                    limits,
-                    requested_timeout=timeout_seconds,
+                    max_output_bytes=settings.max_output_bytes,
                     managed_temp_directory=(
                         os.fspath(temp_task.host_path) if temp_task is not None else None
                     ),
                 )
-                if result.timed_out:
-                    self.ctx.logger.warning(
-                        "%s 命令执行超时：command_id=%s exit_code=%s",
-                        mode_label,
-                        audit_id,
-                        result.exit_code,
-                    )
-                elif result.exit_code != 0:
+                if result.exit_code != 0:
                     self.ctx.logger.warning(
                         "%s 命令执行失败：command_id=%s exit_code=%s",
                         mode_label,
@@ -2704,8 +2684,9 @@ class ServerCommandPlugin(MaiBotPlugin):
                     "execution_mode": execution_mode,
                     "command_regex_guard": "disabled",
                     "working_directory": "/root",
-                    "process_limit": "not_enforced_for_uid_0",
-                    "descendant_cleanup": "on_command_exit_or_timeout",
+                    "sandbox_resource_limits": "disabled_for_root",
+                    "output_capture_limit": "enabled",
+                    "descendant_cleanup": "on_command_exit_or_cancellation",
                 }
             finally:
                 await self._release_command_temp(temp_task)
@@ -2739,8 +2720,9 @@ class ServerCommandPlugin(MaiBotPlugin):
                     "execution_mode": "root_restricted",
                     "command_regex_guard": "enabled",
                     "working_directory": "/root",
-                    "process_limit": "not_enforced_for_uid_0",
-                    "descendant_cleanup": "on_command_exit_or_timeout",
+                    "sandbox_resource_limits": "disabled_for_root",
+                    "output_capture_limit": "enabled",
+                    "descendant_cleanup": "on_command_exit_or_cancellation",
                 }
             try:
                 temp_task = await self._create_command_temp(
@@ -2768,25 +2750,18 @@ class ServerCommandPlugin(MaiBotPlugin):
                 }
             try:
                 self.ctx.logger.critical(
-                    "麦麦准备执行受限 ROOT 命令：command_id=%s cwd=/root timeout=%ss",
+                    "麦麦准备执行受限 ROOT 命令：command_id=%s cwd=/root "
+                    "sandbox_resource_limits=disabled",
                     audit_id,
-                    min(max(1, int(timeout_seconds)), limits.normalized().timeout_seconds),
                 )
                 result = await run_root_command(
                     str(command),
-                    limits,
-                    requested_timeout=timeout_seconds,
+                    max_output_bytes=settings.max_output_bytes,
                     managed_temp_directory=(
                         os.fspath(temp_task.host_path) if temp_task is not None else None
                     ),
                 )
-                if result.timed_out:
-                    self.ctx.logger.warning(
-                        "受限 ROOT 命令执行超时：command_id=%s exit_code=%s",
-                        audit_id,
-                        result.exit_code,
-                    )
-                elif result.exit_code != 0:
+                if result.exit_code != 0:
                     self.ctx.logger.warning(
                         "受限 ROOT 命令执行失败：command_id=%s exit_code=%s",
                         audit_id,
@@ -2811,8 +2786,9 @@ class ServerCommandPlugin(MaiBotPlugin):
                     "execution_mode": "root_restricted",
                     "command_regex_guard": "enabled",
                     "working_directory": "/root",
-                    "process_limit": "not_enforced_for_uid_0",
-                    "descendant_cleanup": "on_command_exit_or_timeout",
+                    "sandbox_resource_limits": "disabled_for_root",
+                    "output_capture_limit": "enabled",
+                    "descendant_cleanup": "on_command_exit_or_cancellation",
                 }
             finally:
                 await self._release_command_temp(temp_task)
@@ -2822,6 +2798,13 @@ class ServerCommandPlugin(MaiBotPlugin):
                 root_active=True,
             )
 
+        limits = SandboxLimits(
+            timeout_seconds=settings.timeout_seconds,
+            max_output_bytes=settings.max_output_bytes,
+            memory_limit_mb=settings.memory_limit_mb,
+            file_size_limit_mb=settings.file_size_limit_mb,
+            max_processes=settings.max_processes,
+        )
         if self.config.root_mode.enabled:
             self.ctx.logger.warning(
                 "受限 ROOT 配置不完整，本次继续使用低权限沙箱：reason=%s",

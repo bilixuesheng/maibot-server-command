@@ -8,7 +8,9 @@ import io
 import json
 import os
 import re
+import resource
 import shutil
+import shlex
 import signal
 import stat
 import sys
@@ -210,7 +212,10 @@ class DeclarationTests(unittest.TestCase):
         self.assertNotIn("白名单 QQ 本人在群聊触发", component_text)
         self.assertNotIn("可信群聊", component_text)
         self.assertIn("所有群聊始终执行普通扫描", component_text)
-        self.assertEqual(components["run_server_command"]["timeout_ms"], 330_000)
+        self.assertEqual(
+            components["run_server_command"]["timeout_ms"],
+            plugin_module.COMMAND_RPC_TIMEOUT_MS,
+        )
         self.assertEqual(
             components["send_server_file_to_qq"]["timeout_ms"],
             1_800_000,
@@ -232,6 +237,15 @@ class DeclarationTests(unittest.TestCase):
             )
             parameters = component["metadata"]["parameters_raw"]["properties"]
             self.assertNotIn("stream_id", parameters)
+        trusted_command = components["run_trusted_private_server_command"]
+        self.assertEqual(
+            trusted_command["timeout_ms"],
+            plugin_module.COMMAND_RPC_TIMEOUT_MS,
+        )
+        trusted_parameters = trusted_command["metadata"]["parameters_raw"][
+            "properties"
+        ]
+        self.assertNotIn("timeout_seconds", trusted_parameters)
 
     def test_sibling_module_cache_names_are_content_addressed(self) -> None:
         names = (
@@ -1223,6 +1237,119 @@ class AuthorizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(error_type, "")
 
 
+class RootExecutionPolicyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_root_launcher_has_no_sandbox_limits_or_command_timeout(
+        self,
+    ) -> None:
+        fake_process = FakeProcess()
+        captured_args: tuple[object, ...] = ()
+        captured_kwargs: dict[str, object] = {}
+
+        async def fake_create_subprocess(*args, **kwargs):
+            nonlocal captured_args, captured_kwargs
+            captured_args = args
+            captured_kwargs = kwargs
+            fake_process.stop(returncode=0)
+            return fake_process
+
+        with (
+            patch.object(executor, "_is_ubuntu", return_value=True),
+            patch.object(executor.os, "geteuid", return_value=0),
+            patch.object(
+                executor.asyncio,
+                "create_subprocess_exec",
+                side_effect=fake_create_subprocess,
+            ),
+            patch.object(
+                executor.asyncio,
+                "wait_for",
+                side_effect=AssertionError("ROOT 正常执行路径不应设置命令超时"),
+            ) as wait_for,
+        ):
+            result = await executor.run_unrestricted_root_command(
+                "printf root-ok",
+                max_output_bytes=123_456,
+            )
+
+        self.assertEqual(
+            captured_args,
+            (
+                sys.executable,
+                str(Path(executor.__file__).resolve(strict=True)),
+                executor.ROOT_SUPERVISOR_FLAG,
+                "printf root-ok",
+            ),
+        )
+        self.assertNotIn("preexec_fn", captured_kwargs)
+        wait_for.assert_not_called()
+        self.assertEqual(result.exit_code, 0)
+        self.assertFalse(result.timed_out)
+
+    async def test_restricted_root_still_rejects_high_risk_commands(self) -> None:
+        with (
+            patch.object(executor, "_is_ubuntu", return_value=True),
+            patch.object(executor.os, "geteuid", return_value=0),
+        ):
+            with self.assertRaises(executor.HighRiskCommandError):
+                await executor.run_root_command("rm -rf /")
+
+    async def test_plugin_root_branch_ignores_sandbox_resource_settings(
+        self,
+    ) -> None:
+        plugin = plugin_module.ServerCommandPlugin()
+        plugin._set_context(ContextStub([]))
+        configure_plugin(
+            plugin,
+            {
+                "sandbox": {
+                    "timeout_seconds": 1,
+                    "max_output_bytes": 123_456,
+                    "memory_limit_mb": 64,
+                    "file_size_limit_mb": 1,
+                }
+            },
+        )
+        command_result = executor.CommandResult(
+            command="printf root-ok",
+            exit_code=0,
+            stdout="root-ok",
+            stderr="",
+            timed_out=False,
+            output_truncated=False,
+        )
+        run_root = AsyncMock(return_value=command_result)
+        create_temp = AsyncMock(return_value=None)
+        release_temp = AsyncMock()
+
+        with (
+            patch.object(plugin, "_root_mode_state", return_value=(True, "ok")),
+            patch.object(
+                plugin,
+                "_unrestricted_root_state",
+                return_value=(False, "disabled"),
+            ),
+            patch.object(plugin, "_create_command_temp", create_temp),
+            patch.object(plugin, "_release_command_temp", release_temp),
+            patch.object(plugin_module, "run_root_command", run_root),
+        ):
+            payload = await plugin.handle_run_server_command(
+                "printf root-ok",
+                timeout_seconds=1,
+            )
+
+        run_root.assert_awaited_once_with(
+            "printf root-ok",
+            max_output_bytes=123_456,
+            managed_temp_directory=None,
+        )
+        self.assertEqual(payload["execution_mode"], "root_restricted")
+        self.assertEqual(
+            payload["sandbox_resource_limits"],
+            "disabled_for_root",
+        )
+        self.assertFalse(payload["timed_out"])
+
+
 class CancellationTests(unittest.IsolatedAsyncioTestCase):
     async def test_sandbox_cancellation_kills_and_reaps_process_group(self) -> None:
         fake_process = FakeProcess()
@@ -1304,7 +1431,6 @@ class CancellationTests(unittest.IsolatedAsyncioTestCase):
             task = asyncio.create_task(
                 executor.run_unrestricted_root_command(
                     "sleep 60",
-                    executor.SandboxLimits(timeout_seconds=300),
                 )
             )
             await asyncio.wait_for(fake_process.started.wait(), timeout=1)
@@ -1317,24 +1443,33 @@ class CancellationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RealUbuntuIntegrationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_real_bubblewrap_and_root_execution(self) -> None:
+    @staticmethod
+    def _require_real_integration(*, bubblewrap: bool) -> None:
         if os.environ.get("MAIBOT_INTEGRATION") != "1":
-            self.skipTest("未启用真实 Ubuntu 集成测试")
+            raise unittest.SkipTest("未启用真实 Ubuntu 集成测试")
         if (
             os.geteuid() != 0
             or not executor._is_ubuntu()
-            or shutil.which("bwrap") is None
             or not Path("/proc/self/stat").is_file()
         ):
-            self.skipTest("真实集成测试需要 Ubuntu root、Bubblewrap 和 procfs")
+            raise unittest.SkipTest("真实集成测试需要 Ubuntu root 和 procfs")
+        if bubblewrap and shutil.which("bwrap") is None:
+            raise unittest.SkipTest("真实沙箱集成测试需要 Bubblewrap")
 
+    async def test_real_bubblewrap_execution(self) -> None:
+        self._require_real_integration(bubblewrap=True)
         with tempfile.TemporaryDirectory(
             prefix="maibot-integration-",
             dir="/tmp",
         ) as directory:
             maibot_root = Path(directory)
             identity = executor.resolve_execution_identity()
-            sandbox = executor.prepare_sandbox(maibot_root, identity)
+            try:
+                sandbox = executor.prepare_sandbox(maibot_root, identity)
+            except OSError as exc:
+                if exc.errno == 22:
+                    self.skipTest("当前用户命名空间不能映射低权限沙箱 UID/GID")
+                raise
             sandbox_result = await executor.run_command(
                 "pwd; id -u; printf sandbox-ok > integration.txt",
                 sandbox,
@@ -1351,13 +1486,64 @@ class RealUbuntuIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 "sandbox-ok",
             )
 
+    async def test_real_root_has_no_sandbox_resource_limits(self) -> None:
+        self._require_real_integration(bubblewrap=False)
+        with tempfile.TemporaryDirectory(
+            prefix="maibot-root-integration-",
+            dir="/tmp",
+        ) as directory:
             root_result = await executor.run_unrestricted_root_command(
                 "printf '%s:' \"$PWD\"; id -u",
-                executor.SandboxLimits(timeout_seconds=5),
-                requested_timeout=5,
             )
             self.assertEqual(root_result.exit_code, 0, root_result.stderr)
             self.assertEqual(root_result.stdout, "/root:0\n")
+
+            resource_names = (
+                "RLIMIT_AS",
+                "RLIMIT_FSIZE",
+                "RLIMIT_CPU",
+                "RLIMIT_NOFILE",
+                "RLIMIT_NPROC",
+            )
+            parent_limits = {
+                name: list(resource.getrlimit(getattr(resource, name)))
+                for name in resource_names
+            }
+            limit_probe = (
+                "import json,resource;"
+                f"names={resource_names!r};"
+                "print(json.dumps({name:list(resource.getrlimit("
+                "getattr(resource,name))) for name in names},sort_keys=True))"
+            )
+            limit_result = await executor.run_unrestricted_root_command(
+                f"{shlex.quote(sys.executable)} -c {shlex.quote(limit_probe)}",
+            )
+            self.assertEqual(limit_result.exit_code, 0, limit_result.stderr)
+            self.assertEqual(json.loads(limit_result.stdout), parent_limits)
+
+            root_large_file = Path(directory) / "root-over-old-limit.bin"
+            resource_probe = (
+                "from pathlib import Path;"
+                "data=bytearray(300*1024*1024);"
+                f"path=Path({str(root_large_file)!r});"
+                "handle=path.open('wb');"
+                "chunk=b'0'*(1024*1024);"
+                "handle.write(chunk*65);"
+                "handle.close();"
+                "print(len(data),path.stat().st_size)"
+            )
+            resource_result = await executor.run_unrestricted_root_command(
+                f"{shlex.quote(sys.executable)} -c {shlex.quote(resource_probe)}",
+            )
+            self.assertEqual(
+                resource_result.exit_code,
+                0,
+                resource_result.stderr,
+            )
+            self.assertEqual(
+                resource_result.stdout.strip(),
+                f"{300 * 1024 * 1024} {65 * 1024 * 1024}",
+            )
 
 
 if __name__ == "__main__":

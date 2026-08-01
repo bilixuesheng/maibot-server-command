@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "xuesheng.maibot-server-command",
-  "version": "1.0.19",
+  "version": "1.0.20",
   "name": "麦麦操作服务器与发送文件",
   "description": "让 MaiBot 运行受控服务器命令、发送服务器文件并安全清理临时副本",
   "author": {

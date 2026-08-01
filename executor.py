@@ -1,4 +1,4 @@
-"""Ubuntu command runner confined to MaiBot's maibot-command-file directory."""
+"""Ubuntu command runner for sandboxed and explicitly authorized ROOT modes."""
 
 from __future__ import annotations
 
@@ -494,7 +494,7 @@ def _limit_child(
     *,
     enforce_process_limit: bool = True,
 ) -> None:
-    """Apply inherited Unix resource limits immediately before exec."""
+    """Apply low-privilege sandbox limits immediately before exec."""
 
     libc = ctypes.CDLL(None, use_errno=True)
     pr_set_no_new_privs = 38
@@ -690,7 +690,7 @@ def _wait_status_to_exit_code(status: int) -> int:
     return 1
 
 
-def _root_supervisor_main(command: str, limits: SandboxLimits) -> int:
+def _root_supervisor_main(command: str) -> int:
     """Supervise one root shell and clean every descendant before returning."""
 
     _set_child_subreaper()
@@ -708,7 +708,6 @@ def _root_supervisor_main(command: str, limits: SandboxLimits) -> int:
     if primary_pid == 0:
         try:
             os.setsid()
-            _limit_child(limits, enforce_process_limit=False)
             os.chdir(ROOT_WORKING_DIRECTORY)
             environment = {
                 "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -752,17 +751,10 @@ def _root_supervisor_main(command: str, limits: SandboxLimits) -> int:
     return _wait_status_to_exit_code(primary_status)
 
 
-def _parse_root_supervisor_args(argv: list[str]) -> tuple[str, SandboxLimits]:
-    if len(argv) != 8 or argv[1] != ROOT_SUPERVISOR_FLAG:
+def _parse_root_supervisor_args(argv: list[str]) -> str:
+    if len(argv) != 3 or argv[1] != ROOT_SUPERVISOR_FLAG:
         raise ValueError("root supervisor 参数无效")
-    limits = SandboxLimits(
-        timeout_seconds=int(argv[2]),
-        max_output_bytes=int(argv[3]),
-        memory_limit_mb=int(argv[4]),
-        file_size_limit_mb=int(argv[5]),
-        max_processes=int(argv[6]),
-    ).normalized()
-    return argv[7], limits
+    return argv[2]
 
 
 async def _stop_root_supervisor(process: asyncio.subprocess.Process) -> None:
@@ -898,9 +890,8 @@ async def run_command(
 
 async def _run_root_command(
     command: str,
-    limits: SandboxLimits,
-    requested_timeout: int | None = None,
     *,
+    max_output_bytes: int,
     enforce_high_risk_guard: bool,
     managed_temp_directory: str | None = None,
 ) -> CommandResult:
@@ -918,10 +909,10 @@ async def _run_root_command(
     if not ROOT_WORKING_DIRECTORY.is_dir():
         raise SandboxError("root 工作目录 /root 不存在，拒绝执行命令。")
 
-    normalized = limits.normalized()
-    timeout = normalized.timeout_seconds
-    if requested_timeout is not None:
-        timeout = max(1, min(int(requested_timeout), timeout))
+    output_limit = max(
+        4_096,
+        min(int(max_output_bytes), ABSOLUTE_MAX_OUTPUT_BYTES),
+    )
 
     supervisor_path = str(Path(__file__).resolve(strict=True))
     supervisor_environment = {
@@ -936,11 +927,6 @@ async def _run_root_command(
         sys.executable,
         supervisor_path,
         ROOT_SUPERVISOR_FLAG,
-        str(normalized.timeout_seconds),
-        str(normalized.max_output_bytes),
-        str(normalized.memory_limit_mb),
-        str(normalized.file_size_limit_mb),
-        str(normalized.max_processes),
         command,
         cwd=str(ROOT_WORKING_DIRECTORY),
         env=supervisor_environment,
@@ -955,47 +941,41 @@ async def _run_root_command(
 
     stdout_buffer = bytearray()
     stderr_buffer = bytearray()
-    shared_budget = [normalized.max_output_bytes]
+    shared_budget = [output_limit]
     truncated = [False]
     readers = [
         asyncio.create_task(_capture_stream(process.stdout, stdout_buffer, shared_budget, truncated)),
         asyncio.create_task(_capture_stream(process.stderr, stderr_buffer, shared_budget, truncated)),
     ]
-    timed_out = False
     try:
-        await asyncio.wait_for(process.wait(), timeout=timeout)
-    except TimeoutError:
-        timed_out = True
-        await _stop_root_supervisor(process)
+        await process.wait()
     except asyncio.CancelledError:
         await asyncio.shield(_stop_root_supervisor(process))
         raise
     finally:
         await asyncio.gather(*readers)
 
-    exit_code = 124 if timed_out else int(process.returncode or 0)
     return CommandResult(
         command=command,
-        exit_code=exit_code,
+        exit_code=int(process.returncode or 0),
         stdout=stdout_buffer.decode("utf-8", errors="replace"),
         stderr=stderr_buffer.decode("utf-8", errors="replace"),
-        timed_out=timed_out,
+        timed_out=False,
         output_truncated=truncated[0],
     )
 
 
 async def run_root_command(
     command: str,
-    limits: SandboxLimits,
-    requested_timeout: int | None = None,
+    *,
+    max_output_bytes: int = 65_536,
     managed_temp_directory: str | None = None,
 ) -> CommandResult:
     """Run a restricted-root command after applying the high-risk regex guard."""
 
     return await _run_root_command(
         command,
-        limits,
-        requested_timeout=requested_timeout,
+        max_output_bytes=max_output_bytes,
         enforce_high_risk_guard=True,
         managed_temp_directory=managed_temp_directory,
     )
@@ -1003,21 +983,15 @@ async def run_root_command(
 
 async def run_unrestricted_root_command(
     command: str,
-    limits: SandboxLimits,
-    requested_timeout: int | None = None,
+    *,
+    max_output_bytes: int = 65_536,
     managed_temp_directory: str | None = None,
 ) -> CommandResult:
-    """Run a fully confirmed root command without the high-risk regex guard.
-
-    Operational timeout, output capture and Unix resource ceilings remain in
-    place so a tool call can terminate and return a bounded result. They do not
-    restrict which root operations Bash is allowed to attempt.
-    """
+    """Run a fully confirmed root command without the high-risk regex guard."""
 
     return await _run_root_command(
         command,
-        limits,
-        requested_timeout=requested_timeout,
+        max_output_bytes=max_output_bytes,
         enforce_high_risk_guard=False,
         managed_temp_directory=managed_temp_directory,
     )
@@ -1025,8 +999,8 @@ async def run_unrestricted_root_command(
 
 if __name__ == "__main__":
     try:
-        supervised_command, supervised_limits = _parse_root_supervisor_args(sys.argv)
-        raise SystemExit(_root_supervisor_main(supervised_command, supervised_limits))
+        supervised_command = _parse_root_supervisor_args(sys.argv)
+        raise SystemExit(_root_supervisor_main(supervised_command))
     except BaseException as exc:
         if isinstance(exc, SystemExit):
             raise
