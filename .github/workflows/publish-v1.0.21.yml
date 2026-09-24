@@ -1,0 +1,231 @@
+name: Publish and verify v1.0.21
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/publish-v1.0.21.yml
+
+permissions:
+  contents: write
+
+jobs:
+  gate:
+    name: Release gate / SDK ${{ matrix.sdk }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk:
+          - "2.3.0"
+          - "2.8.2"
+
+    steps:
+      - name: Check out the exact product commit
+        uses: actions/checkout@v4
+        with:
+          ref: c669df5618d636e98174b7166ac0afc8333faeff
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install release-gate dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes bubblewrap util-linux
+          python -m pip install --disable-pip-version-check --upgrade pip
+          python -m pip install "maibot-plugin-sdk==${{ matrix.sdk }}"
+          python -m pip install "ruff==0.12.7"
+
+      - name: Verify release metadata and unchanged compatibility ranges
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          manifest = json.loads(
+              Path("_manifest.json").read_text(encoding="utf-8")
+          )
+          assert manifest["version"] == "1.0.21"
+          assert manifest["name"] == "麦麦操作服务器与发送文件"
+          assert manifest["host_application"] == {
+              "min_version": "1.1.0",
+              "max_version": "1.99.99",
+          }
+          assert manifest["sdk"] == {
+              "min_version": "2.3.0",
+              "max_version": "2.99.99",
+          }
+          PY
+
+      - name: Compile and lint
+        run: |
+          python -m py_compile executor.py file_upload.py plugin.py temp_cleanup.py
+          python -m py_compile tests/test_stability.py
+          ruff check executor.py file_upload.py plugin.py temp_cleanup.py tests
+
+      - name: Run unit and security regression tests
+        env:
+          PYTHONWARNINGS: error::ResourceWarning
+        run: python -m unittest discover -s tests -v
+
+      - name: Run real Bubblewrap and ROOT integration
+        shell: bash
+        run: |
+          PYTHON_BIN="$(command -v python)"
+          sudo env MAIBOT_INTEGRATION=1 "$PYTHON_BIN" \
+            -m unittest tests.test_stability.RealUbuntuIntegrationTests -v
+
+  release:
+    name: Create and verify release
+    needs:
+      - gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Refuse an existing tag or release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view v1.0.21 --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Release v1.0.21 already exists; refusing to overwrite it." >&2
+            exit 1
+          fi
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/v1.0.21" >/dev/null 2>&1; then
+            echo "Tag v1.0.21 already exists; refusing to overwrite it." >&2
+            exit 1
+          fi
+
+      - name: Check out the exact product commit
+        uses: actions/checkout@v4
+        with:
+          ref: c669df5618d636e98174b7166ac0afc8333faeff
+          fetch-depth: 0
+
+      - name: Build and verify the exact release archive
+        shell: bash
+        run: |
+          mkdir -p release/maibot-server-command/assets
+          cp .gitignore LICENSE README.md _manifest.json executor.py file_upload.py plugin.py requirements.txt temp_cleanup.py release/maibot-server-command/
+          cp assets/icon.png release/maibot-server-command/assets/icon.png
+          TZ=UTC find release/maibot-server-command -exec touch -t 202609241200.00 {} +
+          (
+            cd release
+            TZ=UTC zip -X -q maibot-server-command-v1.0.21.zip \
+              maibot-server-command/ \
+              maibot-server-command/.gitignore \
+              maibot-server-command/LICENSE \
+              maibot-server-command/README.md \
+              maibot-server-command/_manifest.json \
+              maibot-server-command/assets/ \
+              maibot-server-command/assets/icon.png \
+              maibot-server-command/executor.py \
+              maibot-server-command/file_upload.py \
+              maibot-server-command/plugin.py \
+              maibot-server-command/requirements.txt \
+              maibot-server-command/temp_cleanup.py
+          )
+          echo "7605c7660997239bcb71007701bb17e1b3bb551426aae4556846fccf73ec1bb6  release/maibot-server-command-v1.0.21.zip" | sha256sum --check --strict
+          test "$(unzip -Z1 release/maibot-server-command-v1.0.21.zip | grep -v '/$' | wc -l)" -eq 10
+          test "$(unzip -Z1 release/maibot-server-command-v1.0.21.zip | cut -d/ -f1 | sort -u)" = "maibot-server-command"
+          ! unzip -Z1 release/maibot-server-command-v1.0.21.zip | grep -Eq '(^|/)(config\.toml|ci_|__pycache__|.*\.pyc$|\.github/|tests?/|.*\.patch$)'
+
+      - name: Write release notes
+        shell: bash
+        run: |
+          cat > release-notes.md <<'RELEASE_NOTES'
+          ## 支持版本
+
+          - MaiBot 兼容范围与 1.0.20 相同：1.1.0 ～ 1.99.99；本次发布只更新插件，不修改 MaiBot 主程序。
+          - 已回归 maibot-plugin-sdk：2.3.0 与 2.8.2。
+
+          ## 更新日志
+
+          ### 缺陷修复
+
+          - 受限 ROOT：递归删除拦截现在也能识别换行、`(`、`$(`、反引号、`then`/`do` 等 Shell 关键字、`xargs`/`nohup`/`env` 等包装命令，以及 `/bin/rm`、`\\rm` 形式的 `rm -r`，修复了这些写法可绕过拦截的问题。
+          - 文件上传：发送文件名被拒绝（例如敏感文件名）时不再泄漏已打开的文件描述符。
+          - Python 3.10：沙箱命令超时和 ROOT 监督器兜底清理现在能正确触发（原先 `except TimeoutError` 在 3.10 下捕获不到 `asyncio.wait_for` 的超时）。
+          - 受管临时目录：保留时长改为从命令结束时开始计算，长时间运行的 ROOT 命令结束后其输出不会被提前清理。
+          - 进程内的临时任务记录按保留期自动回收，不再随消息数量无限增长。
+          - 发送过程中调用被取消时，NapCat 暂存副本的状态回收受 `asyncio.shield` 保护。
+
+          ### 性能优化
+
+          - 敏感内容扫描规则与检测结果不变（6 万个随机样本与旧实现逐一比对一致），速度约提升 2～4 倍；1 GiB 本地路径文件的扫描时间约从 4 分钟降到 1 分钟。
+          - 沙箱目录校验和首次准备（整树遍历/chown）移到工作线程，不再阻塞 MaiBot 事件循环。
+
+          ### 保持既有安全边界
+
+          - 白名单只在真实 QQ 私聊发起并发回同一私聊时生效；所有群聊始终执行敏感扫描。
+          - ROOT 资源边界、加密/不透明载荷策略和临时文件精确清理逻辑均与 1.0.20 一致。
+          - 发布包不包含 Host 文件、MaiBot 主程序补丁、测试文件或 CI 文件。
+
+          ## 验证记录
+
+          - SDK 2.3.0 与 2.8.2 各运行 35 项回归（新增 4 项针对本次修复的回归测试），ResourceWarning 作为错误处理。
+          - GitHub Ubuntu 24.04 门禁重复执行编译、Ruff、双 SDK 全量回归及真实 Bubblewrap/ROOT 集成。
+          - 正式 ZIP 只有一个 `maibot-server-command/` 顶层目录和 10 个运行文件，内容与发布源码逐字节一致。
+
+          ## 文件校验
+
+          `maibot-server-command-v1.0.21.zip`
+
+          SHA-256：`7605c7660997239bcb71007701bb17e1b3bb551426aae4556846fccf73ec1bb6`
+          RELEASE_NOTES
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create v1.0.21 \
+            release/maibot-server-command-v1.0.21.zip \
+            --repo "${GITHUB_REPOSITORY}" \
+            --target c669df5618d636e98174b7166ac0afc8333faeff \
+            --title "麦麦操作服务器与发送文件 v1.0.21" \
+            --notes-file release-notes.md \
+            --latest
+
+      - name: Verify the public tag, notes, and asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/v1.0.21")"
+          jq -e '
+            .tag_name == "v1.0.21" and
+            .name == "麦麦操作服务器与发送文件 v1.0.21" and
+            .draft == false and
+            .prerelease == false and
+            ([.assets[] | select(.name == "maibot-server-command-v1.0.21.zip")] | length == 1) and
+            (.assets | length == 1)
+          ' <<<"${release_json}" >/dev/null
+          body="$(jq -r '.body' <<<"${release_json}")"
+          grep -Fq "已回归 maibot-plugin-sdk：2.3.0 与 2.8.2" <<<"${body}"
+          grep -Fq "7605c7660997239bcb71007701bb17e1b3bb551426aae4556846fccf73ec1bb6" <<<"${body}"
+          test "$(gh api "repos/${GITHUB_REPOSITORY}/commits/v1.0.21" --jq '.sha')" = "c669df5618d636e98174b7166ac0afc8333faeff"
+          mkdir -p release-verification
+          gh release download v1.0.21 \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern "maibot-server-command-v1.0.21.zip" \
+            --dir release-verification
+          echo "7605c7660997239bcb71007701bb17e1b3bb551426aae4556846fccf73ec1bb6  release-verification/maibot-server-command-v1.0.21.zip" | sha256sum --check --strict
+
+      - name: Remove this temporary workflow
+        shell: bash
+        run: |
+          git fetch origin main
+          git checkout -B main origin/main
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/publish-v1.0.21.yml
+          git commit -m "chore: remove temporary v1.0.21 release workflow (release and SHA-256 verified)"
+          git push origin HEAD:main
