@@ -213,6 +213,26 @@ def reuse_managed_temp_task(
     )
 
 
+def touch_managed_temp_task(sandbox_root: Path, *, task_id: str) -> None:
+    """Restart the retention clock when a command stops using its task."""
+
+    normalized_id = str(task_id)
+    if not is_managed_task_name(normalized_id):
+        raise TempCleanupError("临时任务 ID 格式无效。")
+    temp_root = managed_temp_root(sandbox_root)
+    root_fd = os.open(os.fspath(temp_root), _directory_open_flags())
+    try:
+        task_fd, task_stat = _open_verified_directory_at(root_fd, normalized_id)
+        try:
+            if task_stat.st_dev != os.fstat(root_fd).st_dev:
+                raise TempCleanupError("临时任务目录位于独立挂载点。")
+            os.utime(task_fd, None)
+        finally:
+            os.close(task_fd)
+    finally:
+        os.close(root_fd)
+
+
 @dataclass
 class _CleanupBudget:
     remaining_entries: int = MAX_ENTRIES_PER_PASS

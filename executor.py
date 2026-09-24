@@ -35,7 +35,10 @@ MANAGED_TEMP_DIRECTORY_NAME: Final = ".maibot-temp"
 _HIGH_RISK_COMMAND_RULES: Final = (
     (
         re.compile(
-            r"(^|[;&|])\s*(?:sudo\s+)?rm\s+[^\n;&|]*(?:-[a-zA-Z]*r|--recursive)",
+            # A new command can start after a newline, an operator, a subshell
+            # or substitution opener, a shell keyword, or a wrapper command.
+            r"(?:^|[\n;&|(){}`!]|\b(?:then|do|else|elif|exec|nohup|xargs|command|env|time)\b)"
+            r"\s*(?:sudo\s+)?(?:[\w./-]*/)?\\?rm\s+[^\n;&|]*(?:-[a-zA-Z]*r|--recursive)",
             re.IGNORECASE,
         ),
         "递归删除文件或目录",
@@ -772,7 +775,7 @@ async def _stop_root_supervisor(process: asyncio.subprocess.Process) -> None:
             timeout=ROOT_SUPERVISOR_GRACE_SECONDS,
         )
         return
-    except TimeoutError:
+    except asyncio.TimeoutError:
         pass
 
     # The supervisor normally exits in milliseconds. If it does not, clean the
@@ -827,7 +830,8 @@ async def run_command(
             raise SandboxError(
                 "服务器缺少 /usr/bin/setpriv；请先安装 Ubuntu 的 util-linux 软件包。"
             )
-    validate_sandbox_contents(sandbox)
+    # The walk is proportional to the sandbox size; keep it off the event loop.
+    await asyncio.to_thread(validate_sandbox_contents, sandbox)
     sandbox_fd = os.open(
         sandbox,
         os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW,
@@ -868,7 +872,7 @@ async def run_command(
     timed_out = False
     try:
         await asyncio.wait_for(process.wait(), timeout=timeout)
-    except TimeoutError:
+    except asyncio.TimeoutError:
         timed_out = True
         await _stop_process_group(process)
     except asyncio.CancelledError:

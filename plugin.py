@@ -129,6 +129,7 @@ delete_uploaded_managed_file = _temp_cleanup.delete_uploaded_managed_file
 ensure_managed_temp_root = _temp_cleanup.ensure_managed_temp_root
 is_managed_task_name = _temp_cleanup.is_managed_task_name
 reuse_managed_temp_task = _temp_cleanup.reuse_managed_temp_task
+touch_managed_temp_task = _temp_cleanup.touch_managed_temp_task
 
 TEMP_SESSION_IDLE_SECONDS = 30 * 60
 _QQ_USER_ID_RE = re.compile(r"[1-9][0-9]{4,19}\Z")
@@ -842,6 +843,19 @@ class ServerCommandPlugin(MaiBotPlugin):
             self._managed_temp_root = None
         self._sandbox_error = ""
 
+    async def _ensure_low_privilege_sandbox(self) -> None:
+        """Prepare the sandbox in a worker thread under the shared lock."""
+
+        async with self._cleanup_lock:
+            if (
+                self._sandbox_path is None
+                or not self._sandbox_prepared_for_low_privilege
+            ):
+                await asyncio.to_thread(
+                    self._initialize_sandbox,
+                    low_privilege=True,
+                )
+
     async def _run_cleanup_once(self, trigger: str) -> CleanupReport:
         report = CleanupReport()
         if self.config.temp_cleanup.enabled:
@@ -1074,6 +1088,7 @@ class ServerCommandPlugin(MaiBotPlugin):
                 raise TempCleanupError("temp_task_id 格式无效。")
 
             now = asyncio.get_running_loop().time()
+            self._prune_temp_task_records(now)
             task: ManagedTempTask | None = None
             explicit_reuse = bool(requested)
             candidate_id = requested
@@ -1128,6 +1143,23 @@ class ServerCommandPlugin(MaiBotPlugin):
             )
             return task
 
+    def _prune_temp_task_records(self, now: float) -> None:
+        """Forget idle task records so per-message session keys cannot pile up."""
+
+        max_idle_seconds = max(
+            TEMP_SESSION_IDLE_SECONDS,
+            int(self.config.temp_cleanup.retention_hours) * 60 * 60,
+        )
+        for task_id, record in list(self._known_temp_tasks.items()):
+            if (
+                task_id not in self._active_temp_tasks
+                and now - record[2] > max_idle_seconds
+            ):
+                del self._known_temp_tasks[task_id]
+        for stream_key, task_id in list(self._stream_temp_tasks.items()):
+            if task_id not in self._known_temp_tasks:
+                del self._stream_temp_tasks[stream_key]
+
     async def _release_command_temp(self, task: ManagedTempTask | None) -> None:
         if task is None:
             return
@@ -1144,6 +1176,16 @@ class ServerCommandPlugin(MaiBotPlugin):
                     record[1],
                     asyncio.get_running_loop().time(),
                 )
+            if self._sandbox_path is not None:
+                # Retention counts from the end of use. ROOT commands have no
+                # runtime limit, so the start-time mtime could already be
+                # past the retention window when a long command finishes.
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(
+                        touch_managed_temp_task,
+                        self._sandbox_path,
+                        task_id=task.task_id,
+                    )
 
     def _decorate_temp_policy(
         self,
@@ -1326,7 +1368,9 @@ class ServerCommandPlugin(MaiBotPlugin):
                 )
                 return False, staging_status, "UnconfirmedAdapterResult"
         except asyncio.CancelledError:
-            await self._finish_local_staging(prepared, sent=False)
+            await asyncio.shield(
+                self._finish_local_staging(prepared, sent=False)
+            )
             raise
         except Exception as exc:
             staging_status = await self._finish_local_staging(
@@ -1408,11 +1452,7 @@ class ServerCommandPlugin(MaiBotPlugin):
                 root_reason,
             )
         try:
-            if (
-                self._sandbox_path is None
-                or not self._sandbox_prepared_for_low_privilege
-            ):
-                self._initialize_sandbox(low_privilege=True)
+            await self._ensure_low_privilege_sandbox()
         except Exception as exc:
             self._sandbox_path = None
             self._sandbox_prepared_for_low_privilege = False
@@ -2183,25 +2223,21 @@ class ServerCommandPlugin(MaiBotPlugin):
                     audit_id,
                     unrestricted_reason,
                 )
-            if (
-                self._sandbox_path is None
-                or not self._sandbox_prepared_for_low_privilege
-            ):
-                try:
-                    self._initialize_sandbox(low_privilege=True)
-                except Exception as exc:
-                    self._sandbox_error = str(exc)
-                    self.ctx.logger.exception(
-                        "QQ 文件上传失败：沙箱初始化失败：upload_id=%s",
-                        audit_id,
-                    )
-                    return {
-                        "success": False,
-                        "name": "send_server_file_to_qq",
-                        "content": f"沙箱初始化失败，文件未读取也未发送：{exc}",
-                        "upload_id": audit_id,
-                        "execution_mode": execution_mode,
-                    }
+            try:
+                await self._ensure_low_privilege_sandbox()
+            except Exception as exc:
+                self._sandbox_error = str(exc)
+                self.ctx.logger.exception(
+                    "QQ 文件上传失败：沙箱初始化失败：upload_id=%s",
+                    audit_id,
+                )
+                return {
+                    "success": False,
+                    "name": "send_server_file_to_qq",
+                    "content": f"沙箱初始化失败，文件未读取也未发送：{exc}",
+                    "upload_id": audit_id,
+                    "execution_mode": execution_mode,
+                }
 
         if self.config.temp_cleanup.enabled and self._managed_temp_root is None:
             try:
@@ -2810,20 +2846,16 @@ class ServerCommandPlugin(MaiBotPlugin):
                 "受限 ROOT 配置不完整，本次继续使用低权限沙箱：reason=%s",
                 root_reason,
             )
-        if (
-            self._sandbox_path is None
-            or not self._sandbox_prepared_for_low_privilege
-        ):
-            try:
-                self._initialize_sandbox(low_privilege=True)
-            except Exception as exc:
-                self._sandbox_error = str(exc)
-                self.ctx.logger.exception("麦麦调用沙箱命令失败：沙箱初始化失败：error=%s", exc)
-                return {
-                    "success": False,
-                    "name": "run_server_command",
-                    "content": f"沙箱初始化失败，命令未执行：{exc}",
-                }
+        try:
+            await self._ensure_low_privilege_sandbox()
+        except Exception as exc:
+            self._sandbox_error = str(exc)
+            self.ctx.logger.exception("麦麦调用沙箱命令失败：沙箱初始化失败：error=%s", exc)
+            return {
+                "success": False,
+                "name": "run_server_command",
+                "content": f"沙箱初始化失败，命令未执行：{exc}",
+            }
 
         try:
             temp_task = await self._create_command_temp(

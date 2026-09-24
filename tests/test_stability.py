@@ -813,6 +813,22 @@ class FileUploadTests(unittest.TestCase):
                 (staging_root / str(prepared.staging_name)).exists()
             )
 
+    def test_rejected_upload_name_does_not_leak_file_descriptor(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="maibot-upload-") as directory:
+            source = Path(directory) / "report.txt"
+            source.write_text("ordinary report", encoding="utf-8")
+            before = len(os.listdir("/proc/self/fd"))
+            for _ in range(20):
+                with self.assertRaises(file_upload.FileUploadError):
+                    file_upload.prepare_file_upload(
+                        os.fspath(source),
+                        sandbox_root=None,
+                        root_mode=True,
+                        configured_max_mb=1,
+                        upload_name="id_rsa",
+                    )
+            self.assertEqual(len(os.listdir("/proc/self/fd")), before)
+
 
 class CleanupTests(unittest.TestCase):
     def test_root_scan_obeys_the_shared_entry_budget(self) -> None:
@@ -879,6 +895,32 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual(active_report.skipped_active, 1)
         self.assertEqual(expired_report.deleted_tasks, 1)
         self.assertFalse(task.host_path.exists())
+
+    def test_touch_restarts_retention_after_long_command(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="maibot-cleanup-") as directory:
+            sandbox = Path(directory)
+            task = temp_cleanup.create_managed_temp_task(
+                sandbox,
+                command_uid=os.geteuid(),
+                command_gid=os.getegid(),
+            )
+            (task.host_path / "nested").mkdir()
+            (task.host_path / "nested" / "result.txt").write_text(
+                "result",
+                encoding="utf-8",
+            )
+            # Simulate a command that started three hours ago.
+            started = temp_cleanup.time.time() - 3 * 60 * 60
+            os.utime(task.host_path, (started, started))
+            temp_cleanup.touch_managed_temp_task(sandbox, task_id=task.task_id)
+            report = temp_cleanup.cleanup_expired_tasks(
+                sandbox,
+                retention_hours=1,
+            )
+            self.assertEqual(report.deleted_tasks, 0)
+            self.assertTrue(task.host_path.exists())
+            with self.assertRaises(temp_cleanup.TempCleanupError):
+                temp_cleanup.touch_managed_temp_task(sandbox, task_id="../x")
 
 
 class AuthorizationTests(unittest.IsolatedAsyncioTestCase):
@@ -1292,6 +1334,65 @@ class RootExecutionPolicyTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.assertRaises(executor.HighRiskCommandError):
                 await executor.run_root_command("rm -rf /")
+
+    def test_recursive_delete_guard_covers_new_command_positions(self) -> None:
+        for command in (
+            "echo ok\nrm -rf /",
+            "(rm -rf /)",
+            "echo $(rm -rf /)",
+            "echo `rm -rf /`",
+            "if true; then rm -rf /; fi",
+            "{ rm -R /srv; }",
+            "find / | xargs rm -rf",
+            "nohup /bin/rm -rf / &",
+            "\\rm -rf /",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(
+                    executor.high_risk_command_reason(command),
+                    "递归删除文件或目录",
+                )
+        for command in (
+            "rm notes.txt",
+            "rm a.txt; ls -R",
+            "grep -r rm .",
+            "echo firm -r",
+            "cat docs/rm-notes -r",
+        ):
+            with self.subTest(command=command):
+                self.assertIsNone(executor.high_risk_command_reason(command))
+
+    async def test_idle_temp_task_records_are_pruned(self) -> None:
+        plugin = plugin_module.ServerCommandPlugin()
+        plugin._set_context(ContextStub([]))
+        configure_plugin(plugin, {"temp_cleanup": {"retention_hours": 1}})
+        idle_task = temp_cleanup.ManagedTempTask(
+            task_id="task-" + "a" * 32,
+            host_path=Path("/nonexistent/a"),
+            sandbox_path="/work/.maibot-temp/a",
+        )
+        active_task = temp_cleanup.ManagedTempTask(
+            task_id="task-" + "b" * 32,
+            host_path=Path("/nonexistent/b"),
+            sandbox_path="/work/.maibot-temp/b",
+        )
+        plugin._known_temp_tasks = {
+            idle_task.task_id: (idle_task, False, 0.0),
+            active_task.task_id: (active_task, False, 0.0),
+        }
+        plugin._active_temp_tasks = {active_task.task_id: 1}
+        plugin._stream_temp_tasks = {
+            "stream\x1fmessage-1": idle_task.task_id,
+            "stream\x1fmessage-2": active_task.task_id,
+        }
+
+        plugin._prune_temp_task_records(2 * 60 * 60.0)
+
+        self.assertEqual(list(plugin._known_temp_tasks), [active_task.task_id])
+        self.assertEqual(
+            plugin._stream_temp_tasks,
+            {"stream\x1fmessage-2": active_task.task_id},
+        )
 
     async def test_plugin_root_branch_ignores_sandbox_resource_settings(
         self,

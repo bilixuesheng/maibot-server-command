@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import io
+import itertools
 import mimetypes
 import os
 import re
@@ -113,21 +114,23 @@ _PRIVATE_KEY_HEADER_LINE_RE = re.compile(
 _PRIVATE_KEY_CHECKSUM_LINE_RE = re.compile(rb"=[A-Za-z0-9+/]{4}\Z")
 _HIGH_CONFIDENCE_CONTENT_RULES: tuple[tuple[re.Pattern[bytes], str], ...] = (
     (
+        # Boundaries are lookarounds rather than consumed alternatives so the
+        # regex engine can scan multi-megabyte windows several times faster.
         re.compile(
-            rb"(?:^|[^A-Za-z0-9])(?:AKIA|ASIA)[A-Z0-9]{16}(?:[^A-Za-z0-9]|$)|"
-            rb"(?:^|[^A-Za-z0-9])gh[pousr]_[A-Za-z0-9]{20,255}(?:[^A-Za-z0-9]|$)|"
-            rb"(?:^|[^A-Za-z0-9])sk-(?:proj-|svcacct-)?"
-            rb"[A-Za-z0-9_-]{32,255}(?:[^A-Za-z0-9_-]|$)|"
-            rb"(?:^|[^A-Za-z0-9])xox[baprs]-[A-Za-z0-9-]{10,255}"
-            rb"(?:[^A-Za-z0-9-]|$)"
+            rb"(?<![A-Za-z0-9])(?:"
+            rb"(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Za-z0-9])|"
+            rb"gh[pousr]_[A-Za-z0-9]{20,255}(?![A-Za-z0-9])|"
+            rb"sk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{32,255}(?![A-Za-z0-9_-])|"
+            rb"xox[baprs]-[A-Za-z0-9-]{10,255}(?![A-Za-z0-9-])"
+            rb")"
         ),
         "检测到访问令牌或云凭据格式",
     ),
     (
         re.compile(
-            rb"(?:^|[^A-Za-z0-9_-])"
+            rb"(?<![A-Za-z0-9_-])"
             rb"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"
-            rb"(?:[^A-Za-z0-9_-]|$)"
+            rb"(?![A-Za-z0-9_-])"
         ),
         "检测到 JWT 访问令牌",
     ),
@@ -160,6 +163,10 @@ _BASE64_BLOCK_RE = re.compile(
     rb"(?![A-Za-z0-9+/=_-])"
 )
 _MANAGED_TASK_RE = re.compile(r"task-[0-9a-f]{32}\Z")
+_PRIVATE_KEY_BEGIN_MARKER_RE = re.compile(rb"-----BEGIN ", re.IGNORECASE)
+_TEXT_DISALLOWED_CONTROL_BYTES = bytes(
+    byte for byte in range(0x20) if byte not in {0x09, 0x0A, 0x0C, 0x0D}
+)
 
 
 class FileUploadError(ValueError):
@@ -375,13 +382,18 @@ def _archive_sensitive_path_reason(path_text: str) -> str | None:
 def _contains_complete_private_key(data: bytes) -> bool:
     """Require a complete armored block with a plausible encoded key body."""
 
+    first_marker = _PRIVATE_KEY_BEGIN_MARKER_RE.search(data)
+    if first_marker is None:
+        return False
+
     label: bytes | None = None
     expected_end = b""
     payload_lines: list[bytes] = []
     payload_started = False
     body_valid = True
 
-    offset = 0
+    # Lines before the first BEGIN marker can never start or complete a block.
+    offset = data.rfind(b"\n", 0, first_marker.start()) + 1
     data_size = len(data)
     while offset <= data_size:
         line_end = data.find(b"\n", offset)
@@ -458,9 +470,8 @@ def _is_probably_text(data: bytes) -> bool:
     sample = data[: 256 * 1024]
     if b"\x00" in sample:
         return False
-    disallowed_controls = sum(
-        byte < 0x20 and byte not in {0x09, 0x0A, 0x0C, 0x0D}
-        for byte in sample
+    disallowed_controls = len(sample) - len(
+        sample.translate(None, _TEXT_DISALLOWED_CONTROL_BYTES)
     )
     return disallowed_controls * 100 <= len(sample) * 2
 
@@ -556,7 +567,11 @@ def _decoded_sensitive_content_reason(
     ):
         candidates.append(stripped)
     candidates.extend(
-        match.group(0) for match in list(_BASE64_BLOCK_RE.finditer(data))[:_MAX_ENCODED_BLOCKS]
+        match.group(0)
+        for match in itertools.islice(
+            _BASE64_BLOCK_RE.finditer(data),
+            _MAX_ENCODED_BLOCKS,
+        )
     )
 
     decoded_total = 0
@@ -1499,14 +1514,15 @@ def prepare_file_upload(
         file_fd, source_name = _open_sandbox_file(path_text, sandbox_root)
         source_scope = "sandbox_only"
 
-    safe_name = validate_upload_name(
-        upload_name if upload_name is not None else source_name,
-        sensitive_guard_enabled=sensitive_guard_enabled,
-    )
-    mime_type = mimetypes.guess_type(safe_name)[0] or "application/octet-stream"
     staging_name: str | None = None
     staging_identity: tuple[int, int, int, int, int, int, int, int] | None = None
     try:
+        # Validate inside the try block so a rejected name cannot leak file_fd.
+        safe_name = validate_upload_name(
+            upload_name if upload_name is not None else source_name,
+            sensitive_guard_enabled=sensitive_guard_enabled,
+        )
+        mime_type = mimetypes.guess_type(safe_name)[0] or "application/octet-stream"
         resolved_path = _resolved_fd_path(file_fd)
         archive_scan_bytes = max(_DEFAULT_MAX_ARCHIVE_SCAN_BYTES, max_bytes)
         if sensitive_guard_enabled:
