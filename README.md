@@ -19,6 +19,15 @@ sudo apt install bubblewrap
 
 > 如果未安装 Bubblewrap，低权限沙箱模式无法运行命令。
 
+版本 1.0.22 按 MaiBot 1.2.5 与 `maibot-plugin-sdk` 2.8.2 的源码核对了插件依赖的
+Host 行为：旧 Action 调用仍由 Host 强制覆盖真实 `stream_id`，`chat_scope`、组件
+`timeout_ms`、聊天流字段和 `send.custom("file")` 均未变化，因此可信私聊与文件发送
+的安全边界保持不变。文件发送现在请求 MaiBot 1.2.0 / SDK 2.8.0 新增的
+`return_details=True`，在新版中把平台确认的消息 ID 写入审计日志和工具结果的
+`platform_message_id` 字段；旧版 Host 或 SDK 忽略该参数时仍按原有的明确
+成功确认判断，消息 ID 显示为不可用。兼容范围不变：MaiBot 1.1.0 起的 1.x 与
+SDK 2.3.0 起的 2.x。
+
 版本 1.0.21 是 1.0.20 的缺陷修复与性能优化版。受限 ROOT 的递归删除正则现在
 也能识别换行、`(`、`$(`、反引号、`then`/`do` 等关键字、`xargs`/`nohup`/`env`
 等包装命令和 `/bin/rm` 形式的 `rm -r`，修复了这些写法可绕过拦截的问题。文件名
@@ -165,6 +174,7 @@ Bubblewrap 的挂载和进程隔离；命令不依赖用户命名空间或 UID �
 - Ubuntu
 - MaiBot 1.1.0 或更高的 1.x 版本
 - `maibot-plugin-sdk` 2.3.0 或更高的 2.x 版本
+- 已按 MaiBot 1.2.5 与 `maibot-plugin-sdk` 2.8.2 核对兼容性；平台消息 ID 回执需要 MaiBot 1.2.0+ 与 SDK 2.8.0+
 - Bubblewrap
 - util-linux（Ubuntu 默认自带，用于 `/usr/bin/setpriv`）
 - QQ 文件上传需要支持文件消息段的 NapCat Adapter；建议使用 1.3.2 或更高版本
@@ -462,7 +472,7 @@ WebUI 中会显示“启用命令工具”“允许命令联网”“沙箱命�
 
 ```toml
 [plugin]
-config_version = "1.0.21"
+config_version = "1.0.22"
 
 [sandbox]
 network_enabled = true
@@ -571,7 +581,7 @@ confirmation_10 = "false"
 
 ## 开发验证
 
-仓库保留了 1.0.21 的稳定性回归测试和常驻 CI。测试覆盖组件声明、可信私聊身份
+仓库保留了 1.0.22 的稳定性回归测试和常驻 CI。测试覆盖组件声明、可信私聊身份
 反查、群聊始终扫描、多机器人账号消歧、加密与嵌套容器、敏感内容与反误报样本、
 NapCat 只读暂存、清理预算、ROOT 不继承沙箱 RLIMIT，以及命令在 Host 取消调用
 时的子进程回收。

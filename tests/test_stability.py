@@ -1261,23 +1261,39 @@ class AuthorizationTests(unittest.IsolatedAsyncioTestCase):
             source_scope="sandbox_only",
         )
 
-        sent, staging_status, error_type = await plugin._send_prepared_file(
-            prepared,
-            "private-1",
+        sent, staging_status, error_type, message_id = (
+            await plugin._send_prepared_file(prepared, "private-1")
         )
         self.assertFalse(sent)
         self.assertEqual(staging_status, "not_applicable")
         self.assertEqual(error_type, "UnconfirmedAdapterResult")
+        self.assertEqual(message_id, "")
+        self.assertIs(plugin.ctx.send.calls[0][1]["return_details"], True)
 
-        plugin.ctx.send.result = {"success": True}
-        sent, staging_status, error_type = await plugin._send_prepared_file(
-            prepared,
-            "private-1",
-        )
-        self.assertTrue(sent)
-        self.assertEqual(staging_status, "not_applicable")
-        self.assertEqual(error_type, "")
-
+        # Old SDK (bool), old Host ({"success"}) and SDK >= 2.8 on MaiBot
+        # >= 1.2 ({"sent", "message_id"}) must all be understood.
+        for result, expected_sent, expected_id in (
+            (True, True, ""),
+            ({"success": True}, True, ""),
+            ({"success": False}, False, ""),
+            ({"sent": True, "message_id": "9876543"}, True, "9876543"),
+            ({"sent": True, "message_id": None}, True, ""),
+            ({"sent": False, "message_id": None}, False, ""),
+            ({"sent": "yes", "success": True}, False, ""),
+            ({"success": "true"}, False, ""),
+        ):
+            with self.subTest(result=result):
+                plugin.ctx.send.result = result
+                sent, staging_status, error_type, message_id = (
+                    await plugin._send_prepared_file(prepared, "private-1")
+                )
+                self.assertIs(sent, expected_sent)
+                self.assertEqual(staging_status, "not_applicable")
+                self.assertEqual(
+                    error_type,
+                    "" if expected_sent else "UnconfirmedAdapterResult",
+                )
+                self.assertEqual(message_id, expected_id)
 
 class RootExecutionPolicyTests(unittest.IsolatedAsyncioTestCase):
     async def test_root_launcher_has_no_sandbox_limits_or_command_timeout(

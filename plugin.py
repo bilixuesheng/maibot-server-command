@@ -1320,12 +1320,38 @@ class ServerCommandPlugin(MaiBotPlugin):
             finally:
                 self._active_staging_uploads.discard(key)
 
+    @staticmethod
+    def _parse_send_result(send_result: Any) -> tuple[bool, str]:
+        """Accept only explicit delivery confirmations from any supported Host.
+
+        MaiBot >= 1.2.0 with SDK >= 2.8.0 honours ``return_details=True`` and
+        returns ``{"sent": bool, "message_id": str | None}``. Older SDKs strip
+        the result to a boolean and older Hosts ignore the flag and answer
+        ``{"success": bool}``; all three shapes remain supported.
+        """
+
+        if send_result is True:
+            return True, ""
+        if not isinstance(send_result, dict):
+            return False, ""
+        confirmed = (
+            send_result.get("sent") is True
+            if "sent" in send_result
+            else send_result.get("success") is True
+        )
+        if not confirmed:
+            return False, ""
+        message_id = send_result.get("message_id")
+        if isinstance(message_id, (str, int)) and not isinstance(message_id, bool):
+            return True, str(message_id).strip()[:128]
+        return True, ""
+
     async def _send_prepared_file(
         self,
         prepared: Any,
         stream_id: str,
-    ) -> tuple[bool, str, str]:
-        """Send one prepared file and return explicit delivery/staging state."""
+    ) -> tuple[bool, str, str, str]:
+        """Send one prepared file and return delivery, staging and message state."""
 
         staging_name = str(getattr(prepared, "staging_name", "") or "")
         staging_root = str(getattr(prepared, "staging_root", "") or "")
@@ -1347,7 +1373,7 @@ class ServerCommandPlugin(MaiBotPlugin):
                 verification = "staging_verification_failed"
             if verification != "staging_verified":
                 await self._finish_local_staging(prepared, sent=False)
-                return False, verification, "StagingVerificationFailed"
+                return False, verification, "StagingVerificationFailed", ""
 
         try:
             send_result = await self.ctx.send.custom(
@@ -1357,16 +1383,17 @@ class ServerCommandPlugin(MaiBotPlugin):
                 storage_message=False,
                 show_log=False,
                 sync_to_maisaka_history=False,
+                return_details=True,
             )
-            confirmed_success = send_result is True or (
-                isinstance(send_result, dict) and send_result.get("success") is True
+            confirmed_success, platform_message_id = self._parse_send_result(
+                send_result
             )
             if not confirmed_success:
                 staging_status = await self._finish_local_staging(
                     prepared,
                     sent=False,
                 )
-                return False, staging_status, "UnconfirmedAdapterResult"
+                return False, staging_status, "UnconfirmedAdapterResult", ""
         except asyncio.CancelledError:
             await asyncio.shield(
                 self._finish_local_staging(prepared, sent=False)
@@ -1377,10 +1404,10 @@ class ServerCommandPlugin(MaiBotPlugin):
                 prepared,
                 sent=False,
             )
-            return False, staging_status, type(exc).__name__
+            return False, staging_status, type(exc).__name__, ""
 
         staging_status = await self._finish_local_staging(prepared, sent=True)
-        return True, staging_status, ""
+        return True, staging_status, "", platform_message_id
 
     async def on_load(self) -> None:
         root_active, root_reason = self._root_mode_state()
@@ -1933,7 +1960,12 @@ class ServerCommandPlugin(MaiBotPlugin):
             prepared.source_scope,
             prepared.transport,
         )
-        sent, staging_status, send_error_type = await self._send_prepared_file(
+        (
+            sent,
+            staging_status,
+            send_error_type,
+            platform_message_id,
+        ) = await self._send_prepared_file(
             prepared,
             stream_id,
         )
@@ -1974,13 +2006,15 @@ class ServerCommandPlugin(MaiBotPlugin):
             )
         self.ctx.logger.critical(
             "可信私聊文件发送完成：upload_id=%s bytes=%s scope=%s "
-            "temporary_cleanup=%s transport=%s staging_cleanup=%s",
+            "temporary_cleanup=%s transport=%s staging_cleanup=%s "
+            "platform_message_id=%s",
             audit_id,
             prepared.size,
             prepared.source_scope,
             cleanup_status,
             prepared.transport,
             staging_status,
+            platform_message_id or "unavailable",
         )
         if cleanup_status in {"deleted", "deleted_file_prune_failed"}:
             cleanup_notice = "文件来自受管临时目录，发送成功后源文件已安全删除。"
@@ -2016,6 +2050,7 @@ class ServerCommandPlugin(MaiBotPlugin):
             "temporary_file_cleanup": cleanup_status,
             "upload_transport": prepared.transport,
             "staging_cleanup": staging_status,
+            "platform_message_id": platform_message_id or None,
         }
 
     @Tool(
@@ -2300,7 +2335,12 @@ class ServerCommandPlugin(MaiBotPlugin):
             sensitive_guard_state,
             prepared.transport,
         )
-        sent, staging_status, send_error_type = await self._send_prepared_file(
+        (
+            sent,
+            staging_status,
+            send_error_type,
+            platform_message_id,
+        ) = await self._send_prepared_file(
             prepared,
             stream_id,
         )
@@ -2342,7 +2382,8 @@ class ServerCommandPlugin(MaiBotPlugin):
             )
         self.ctx.logger.warning(
             "QQ 文件发送完成：upload_id=%s mode=%s scope=%s bytes=%s "
-            "temporary_cleanup=%s transport=%s staging_cleanup=%s",
+            "temporary_cleanup=%s transport=%s staging_cleanup=%s "
+            "platform_message_id=%s",
             audit_id,
             execution_mode,
             prepared.source_scope,
@@ -2350,6 +2391,7 @@ class ServerCommandPlugin(MaiBotPlugin):
             cleanup_status,
             prepared.transport,
             staging_status,
+            platform_message_id or "unavailable",
         )
         if cleanup_status in {"deleted", "deleted_file_prune_failed"}:
             cleanup_notice = "该文件来自受管临时目录，发送成功后源文件已安全删除。"
@@ -2392,6 +2434,7 @@ class ServerCommandPlugin(MaiBotPlugin):
             "temporary_file_cleanup": cleanup_status,
             "upload_transport": prepared.transport,
             "staging_cleanup": staging_status,
+            "platform_message_id": platform_message_id or None,
         }
 
     @Action(
